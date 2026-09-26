@@ -76,6 +76,9 @@ def test_save_entry_computes_total_and_status(client):
     e = r.json()
     assert e["total_kg"] == 22.5
     assert e["counted_by"] == "田中"
+    assert e["counted_on"] == date.today().isoformat()  # 棚卸日は保存した日が自動で入る
+    s = client.get("/api/months/2026-09/summary").json()["categories"][str(client.cat_id)]
+    assert s["counted_from"] == s["counted_to"] == date.today().isoformat()
     assert e["action"] == ""  # 問題なければ対応は残さない
 
 
@@ -91,6 +94,38 @@ def test_expired_entry_shows_in_alerts_and_action(client):
     assert alerts[0]["action"] == "廃棄"
     r = client.put(f"/api/months/{ym}/items/{it['id']}/action", headers=USER, json={"action": "移動", "action_note": "A倉庫"})
     assert r.json()["action"] == "移動"
+
+
+def test_counted_on_can_be_corrected(client):
+    it = items(client, "2026-08")["01009"]
+    url = f"/api/months/2026-08/items/{it['id']}"
+    body = {"room_cases": 1, "mfg_date": "2026-08-10"}
+    assert client.put(url, headers=USER, json=body).json()["counted_on"] == date.today().isoformat()
+    # あとから別の日に直せる
+    assert client.put(url, headers=USER, json={**body, "counted_on": "2026-08-31"}).json()["counted_on"] == "2026-08-31"
+    # 棚卸日を送らずに入れ直しても、直した日は変わらない
+    assert client.put(url, headers=USER, json={**body, "room_cases": 2}).json()["counted_on"] == "2026-08-31"
+    tomorrow = date.fromordinal(date.today().toordinal() + 1).isoformat()
+    assert client.put(url, headers=USER, json={**body, "counted_on": tomorrow}).status_code == 400
+    assert client.put(url, headers=USER, json={**body, "counted_on": "8月31日"}).status_code == 400
+    s = client.get("/api/months/2026-08/summary").json()["categories"][str(client.cat_id)]
+    assert s["counted_from"] == s["counted_to"] == "2026-08-31"
+    assert "棚卸日2026-08-31" in client.get("/api/admin/history?entity=entry", headers=ADMIN).json()[0]["summary"]
+
+
+def test_old_db_gets_counted_on(tmp_path, monkeypatch):
+    import sqlite3
+    from app import db
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE entries (id INTEGER PRIMARY KEY, ym TEXT, item_id INTEGER, counted_by TEXT, counted_at TEXT)")
+    con.execute("INSERT INTO entries VALUES (1, '2026-09', 1, '田中', '2026-09-24T10:00:00')")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", path)
+    db.init()
+    with db.connect() as con:
+        assert con.execute("SELECT counted_on FROM entries").fetchone()[0] == "2026-09-24"
 
 
 def test_mfg_expiry(client):
@@ -116,6 +151,47 @@ def test_expected_stock(client):
     assert items(client, "2026-10")["01009"]["expected_kg"] is None
 
 
+def xlsx(rows) -> bytes:
+    wb = openpyxl.Workbook()
+    for r in rows:
+        wb.active.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_expected_import_from_template(client):
+    url = "/api/admin/months/2026-12/expected/import"
+    r = client.get("/api/months/2026-12/expected.xlsx")
+    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
+    assert [c.value for c in ws[3]] == ["コード", "品名", "分類", "保管", "予想在庫(kg)"]
+    row = next(r for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=1).value == "04084")
+    ws.cell(row=row, column=5).value = 12.5
+    buf = io.BytesIO()
+    ws.parent.save(buf)
+    res = client.post(url, headers=ADMIN, content=buf.getvalue()).json()
+    assert res == {"ok": True, "rows": 1, "changed": 1, "errors": []}
+    assert items(client, "2026-12")["04084"]["expected_kg"] == 12.5
+    assert client.get("/api/admin/history?entity=expected", headers=ADMIN).json()[0]["action"] == "取込"
+    # 同じ値なら更新しない
+    assert client.post(url, headers=ADMIN, content=buf.getvalue()).json()["changed"] == 0
+
+
+def test_expected_import_rules(client):
+    url = "/api/admin/months/2026-12/expected/import"
+    assert client.post(url, headers=USER, content=b"").status_code == 403
+    # 数値になったコードも5桁に戻す。空欄は無視。「kg」付きの文字も読む
+    res = client.post(url, headers=ADMIN, content=xlsx([["メモ"], ["コード", "予想在庫"], [1009, "30kg"], ["04084", None]])).json()
+    assert res["ok"] and res["rows"] == 1
+    assert items(client, "2026-12")["01009"]["expected_kg"] == 30
+    # エラーが1件でもあれば何も書かない
+    res = client.post(url, headers=ADMIN, content=xlsx([["コード", "予想在庫(kg)"], ["01009", 99], ["99999", 1], ["04084", "たくさん"]])).json()
+    assert not res["ok"] and len(res["errors"]) == 2
+    assert items(client, "2026-12")["01009"]["expected_kg"] == 30
+    assert not client.post(url, headers=ADMIN, content=b"not excel").json()["ok"]
+    assert "見出し" in client.post(url, headers=ADMIN, content=xlsx([["a", "b"]])).json()["errors"][0]
+
+
 def test_item_change_and_discontinue_are_logged(client):
     it = items(client)["04084"]
     body = {"code": "04084", "name": "アペックス1000", "category_id": client.cat_id, "case_weight": 8, "active": False}
@@ -138,6 +214,10 @@ def test_approval_flow(client):
     assert client.delete(f"{url}/%E6%8B%85%E5%BD%93%E8%80%85", headers=USER).status_code == 200
 
 
+def test_static_is_not_cached(client):
+    assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
+
+
 def test_export_xlsx(client):
     r = client.get("/api/months/2026-09/export.xlsx")
     assert r.status_code == 200
@@ -146,3 +226,9 @@ def test_export_xlsx(client):
     ws = wb["植蛋"]
     codes = [ws.cell(row=r, column=1).value for r in range(7, ws.max_row + 1)]
     assert set(codes) == {"04084", "01009"}
+    today = date.today()
+    assert f"棚卸日：{today.year}/{today.month}/{today.day}" in ws["A2"].value
+    heads = [ws.cell(row=5, column=c).value for c in range(1, ws.max_column + 1)]
+    col = heads.index("棚卸日") + 1
+    row = codes.index("04084") + 7
+    assert ws.cell(row=row, column=col).value == f"{today.year}/{today.month}/{today.day}"

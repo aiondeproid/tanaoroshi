@@ -20,6 +20,12 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n >= 0 ? n : 0; };
 const fmtKg = (v) => (v == null ? "-" : `${Math.round(v * 1000) / 1000}kg`);
 const jdate = (s) => { if (!s) return ""; const [y, m, d] = s.split("-").map(Number); return `${y}/${m}/${d}`; };
+// "2026-09-26T14:03:05" → "2026/9/26 14:03"
+const jdatetime = (s) => (s ? `${jdate(s.slice(0, 10))} ${s.slice(11, 16)}` : "");
+// 端末の今日。開きっぱなしのタブレットでも日付が変われば追従する
+const localToday = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+const md = (s) => jdate(s).replace(/^\d+\//, ""); // "2026-09-26" → "9/26"
+const mdRange = (from, to) => (from === to ? md(from) : `${md(from)}〜${md(to)}`);
 const round3 = (v) => Math.round(v * 1000) / 1000;
 // 実在庫 − 予想在庫。どちらかが無ければ null
 const diffKg = (total, expected) => (total == null || expected == null ? null : round3(total - expected));
@@ -35,11 +41,11 @@ function toast(msg, err = false) {
   toast.timer = setTimeout(() => (t.hidden = true), err ? 5000 : 2200);
 }
 
-async function api(method, path, body) {
-  const headers = { "Content-Type": "application/json" };
+async function api(method, path, body, raw = false) {
+  const headers = { "Content-Type": raw ? "application/octet-stream" : "application/json" };
   if (state.user) headers["X-User"] = encodeURIComponent(state.user);
   if (state.pin) headers["X-Admin-Pin"] = state.pin;
-  const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const res = await fetch(path, { method, headers, body: body === undefined || raw ? body : JSON.stringify(body) });
   if (!res.ok) {
     let msg = `エラー (${res.status})`;
     try {
@@ -171,7 +177,7 @@ function catCard(c, s) {
       ${s.expired ? `<span class="pill s-expired">期限切れ ${s.expired}</span>` : ""}
       ${s.warn ? `<span class="pill s-warn">× ${s.warn}</span>` : ""}</div>
     <div class="bar${done ? " done" : ""}"><i style="width:${pct}%"></i></div>
-    <div class="row"><span class="muted">入力 ${s.entered} / ${s.total}</span><span class="spacer"></span>
+    <div class="row"><span class="muted">入力 ${s.entered} / ${s.total}${s.counted_from ? `・棚卸日 ${mdRange(s.counted_from, s.counted_to)}` : ""}</span><span class="spacer"></span>
       <span class="dots">${state.meta.roles.map((r) => `<span class="dot${s.approvals[r] ? " on" : ""}">${esc(r)}</span>`).join("")}</span></div>
   </a>`;
 }
@@ -192,7 +198,7 @@ async function renderCategory(id) {
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
         <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? STATUS[it.status] : "未入力"}</span>
-          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}` : ""}
+          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
           ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
     $("#items").querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () =>
@@ -288,6 +294,9 @@ function openEntry(it, cat, done) {
   openSheet(`
     <div class="row"><h3>${esc(it.name)}</h3></div>
     <div class="muted">${esc(it.code)}・${esc(it.storage)}・ケース重量 ${cw ? cw + "kg" : "未設定"}</div>
+    <div class="box"><div class="field"><span>棚卸日</span>
+        <input type="date" id="counted_on" value="${esc(it.counted_on || localToday())}" max="${localToday()}"></div>
+      <div class="muted">${it.entry_id ? `最後の保存：${jdatetime(it.counted_at)}（${esc(it.counted_by)}）` : "今日の日付が入ります。別の日に数えた分はここで直してください"}</div></div>
     ${cw ? "" : `<div class="notice">ケース重量が未設定です。ケース数ではなく「端数」に重さ(kg)を入れてください。</div>`}
     ${split ? loc("room", "資材室") + loc("wh", "倉庫／パレット") : loc("room", "在庫")}
     <div class="box"><div class="row"><span class="label">総重量</span><span class="spacer"></span><span class="total" id="total">0kg</span></div>
@@ -359,7 +368,9 @@ function openEntry(it, cat, done) {
       expiry_kind: segValue($("#kind-seg")) || "賞",
       expiry_date: val("expiry_date") || null, mfg_date: val("mfg_date") || null,
       action: segValue($("#action-seg")), action_date: val("action_date") || null, action_note: val("action_note") || "",
+      counted_on: val("counted_on") || null,
     };
+    if (body.counted_on && body.counted_on > localToday()) return toast("棚卸日に未来の日付は入れられません", true);
     try { await saveExpected(); await api("PUT", `/api/months/${state.ym}/items/${it.id}`, body); closeSheet(); toast("保存しました"); done(); }
     catch (e) { toast(e.message, true); }
   });
@@ -381,7 +392,8 @@ async function renderAlerts() {
       const left = daysLeft(it.expiry_date);
       return `<button class="item" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
-          <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span></span>
+          <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span>
+          <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span></span>
         <span class="side"><span class="pill s-${it.status}">${STATUS[it.status]}</span><br>
           ${it.action ? `<b>${esc(it.action)}</b>${it.action_date ? "<br>" + jdate(it.action_date) : ""}` : `<span style="color:var(--ng)">対応未記入</span>`}</span>
       </button>`;
@@ -450,12 +462,12 @@ async function renderAdmin(tab) {
     $("#pin").addEventListener("keydown", (e) => e.key === "Enter" && go());
     return;
   }
-  const tabs = { items: "品目", categories: "分類", staff: "担当者", history: "変更履歴" };
+  const tabs = { items: "品目", categories: "分類", staff: "担当者", expected: "予想在庫", history: "変更履歴" };
   view.innerHTML = `<a class="back" href="#/">← 戻る</a><h1>管理画面</h1>
     <nav class="tabs">${Object.entries(tabs).map(([k, v]) => `<a href="#/admin/${k}" class="${k === tab ? "on" : ""}">${v}</a>`).join("")}</nav>
     <div id="admin"></div>`;
   try {
-    await { items: adminItems, categories: adminCategories, staff: adminStaff, history: adminHistory }[tab]();
+    await { items: adminItems, categories: adminCategories, staff: adminStaff, expected: adminExpected, history: adminHistory }[tab]();
   } catch (e) {
     if (/PIN/.test(e.message)) { state.pin = null; try { sessionStorage.removeItem("tanaoroshi.pin"); } catch {} return renderAdmin(tab); }
     throw e;
@@ -583,6 +595,37 @@ async function adminStaff() {
     try { await api("PUT", `/api/admin/staff/${s.id}`, { name, sort: Number(sort) || 0, active: !!s.active }); reload(); }
     catch (e) { toast(e.message, true); }
   }));
+}
+
+async function adminExpected() {
+  const [y, m] = state.ym.split("-").map(Number);
+  const el = $("#admin");
+  el.innerHTML = `
+    <p>${y}年${m}月の予想在庫をExcelでまとめて入れます（月は画面上の年月で切り替え）。</p>
+    <ol class="steps">
+      <li>ひな形をダウンロードする（その月の品目と、いま入っている予想在庫が並んでいます）
+        <div><a class="btn" href="/api/months/${state.ym}/expected.xlsx" style="text-decoration:none;display:inline-flex;align-items:center;margin-top:6px">ひな形をダウンロード</a></div></li>
+      <li>「予想在庫(kg)」の列に数字を入れて保存する。空欄の行は変更しません</li>
+      <li>ファイルを選んで取り込む
+        <div class="row" style="margin-top:6px"><input type="file" id="x_file" accept=".xlsx"><button class="btn primary" id="x_go">取り込む</button></div></li>
+    </ol>
+    <p class="muted">「コード」と「予想在庫(kg)」の列があれば、ひな形以外の表でも取り込めます。エラーが1件でもあると何も取り込みません。</p>
+    <div id="x_result"></div>`;
+  $("#x_go").addEventListener("click", async () => {
+    const f = $("#x_file").files[0];
+    if (!f) return toast("ファイルを選んでください", true);
+    const out = $("#x_result");
+    $("#x_go").disabled = true;
+    try {
+      const r = await api("POST", `/api/admin/months/${state.ym}/expected/import`, await f.arrayBuffer(), true);
+      out.innerHTML = r.ok
+        ? `<div class="banner ok">${esc(f.name)}：${r.rows}件を読み込み、${r.changed}件を更新しました（${r.rows - r.changed}件は同じ値）</div>`
+        : `<div class="notice"><b>取り込めませんでした（${r.errors.length}件のエラー）。直してからもう一度取り込んでください。</b>
+            <ul>${r.errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul></div>`;
+      if (r.ok) toast("取り込みました");
+    } catch (e) { toast(e.message, true); }
+    finally { $("#x_go").disabled = false; }
+  });
 }
 
 async function adminHistory() {

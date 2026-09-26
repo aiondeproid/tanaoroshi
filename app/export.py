@@ -26,6 +26,13 @@ def jdate(s: str | None) -> str:
     return f"{d.year}/{d.month}/{d.day}"
 
 
+def counted_range(items) -> str:
+    days = sorted({x["counted_on"] for x in items if x["counted_on"]})
+    if not days:
+        return "未実施"
+    return jdate(days[0]) if len(days) == 1 else f"{jdate(days[0])}〜{jdate(days[-1])}"
+
+
 def safe_title(name: str, used: set) -> str:
     t = "".join(ch for ch in name if ch not in '[]:*?/\\')[:28] or "分類"
     base, n = t, 2
@@ -62,21 +69,21 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
     ws.title = safe_title("期限警告一覧", used)
     cell(ws, 1, 1, f"期限警告一覧（{y}年{m}月 棚卸）", font=Font(size=14, bold=True))
     cell(ws, 2, 1, rule)
-    heads = ["分類", "コード", "品名", "総重量(kg)", "区分", "期限", "判定", "対応", "対応予定日", "対応メモ", "担当者"]
+    heads = ["分類", "コード", "品名", "総重量(kg)", "区分", "期限", "判定", "対応", "対応予定日", "対応メモ", "担当者", "棚卸日"]
     for i, h in enumerate(heads, 1):
         cell(ws, 4, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
     r = 5
     for it in sorted((x for x in rows if x["status"] in ("warn", "expired")), key=lambda x: x["expiry_date"] or ""):
         vals = [it["category_name"], it["code"], it["name"], it["total_kg"], it["expiry_kind"],
                 jdate(it["expiry_date"]), STATUS_TEXT[it["status"]], it["action"], jdate(it["action_date"]),
-                it["action_note"], it["counted_by"]]
+                it["action_note"], it["counted_by"], jdate(it["counted_on"])]
         fill = EXPIRED_FILL if it["status"] == "expired" else WARN_FILL
         for i, v in enumerate(vals, 1):
             cell(ws, r, i, v, border=BORDER, alignment=WRAP, fill=fill)
         r += 1
     if r == 5:
         cell(ws, 5, 1, "警告はありません")
-    for i, w in enumerate([16, 10, 32, 11, 6, 12, 15, 16, 12, 28, 10], 1):
+    for i, w in enumerate([16, 10, 32, 11, 6, 12, 15, 16, 12, 28, 10, 11], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
@@ -91,7 +98,7 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
         split = cat["locations"] == "split"
         ws = wb.create_sheet(safe_title(cat["name"], used))
         cell(ws, 1, 1, f"在庫賞味期限管理（{cat['name']}）", font=Font(size=14, bold=True))
-        cell(ws, 2, 1, f"棚卸月：{y}年{m}月　　出力日：{date.today():%Y/%m/%d}")
+        cell(ws, 2, 1, f"棚卸月：{y}年{m}月　　棚卸日：{counted_range(items)}　　出力日：{date.today():%Y/%m/%d}")
         cell(ws, 3, 1, rule)
 
         # 確認欄（右上）
@@ -105,8 +112,8 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
 
         loc_heads = (["資材室", "", "倉庫/パレット", ""] if split else ["在庫", ""])
         heads = ["コード", "品名", "保管", "ケース重量(kg)", *loc_heads, "総重量(kg)", "区分",
-                 "賞味期限/使用期限", "チェック(レ・×)", "対応", "対応メモ", "担当者"]
-        sub = ["", "", "", "", *(["ケース", "端数kg"] * (2 if split else 1)), "", "", "", "", "", "", ""]
+                 "賞味期限/使用期限", "チェック(レ・×)", "対応", "対応メモ", "担当者", "棚卸日"]
+        sub = ["", "", "", "", *(["ケース", "端数kg"] * (2 if split else 1)), "", "", "", "", "", "", "", ""]
         for i, (h, s) in enumerate(zip(heads, sub), 1):
             cell(ws, 5, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
             cell(ws, 6, i, s, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
@@ -129,7 +136,7 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
             vals = [it["code"], name, it["storage"], it["entry_case_weight"] if entered else it["case_weight"], *loc,
                     it["total_kg"] if entered else None, it["expiry_kind"] if entered else "", expiry,
                     STATUS_TEXT[it["status"]] if entered else "未入力", it["action"] or "", it["action_note"] or "",
-                    it["counted_by"] or ""]
+                    it["counted_by"] or "", jdate(it["counted_on"])]
             fill = {"warn": WARN_FILL, "expired": EXPIRED_FILL}.get(it["status"]) if entered else None
             for i, v in enumerate(vals, 1):
                 x = cell(ws, r, i, v, border=BORDER, alignment=WRAP if i in (2, 14 if split else 12) else CENTER)
@@ -137,7 +144,7 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
                     x.fill = fill
             r += 1
 
-        widths = [10, 30, 6, 9, *([7, 8] * (2 if split else 1)), 10, 5, 13, 11, 14, 22, 9]
+        widths = [10, 30, 6, 9, *([7, 8] * (2 if split else 1)), 10, 5, 13, 11, 14, 22, 9, 11]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "C7"

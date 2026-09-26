@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, unquote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import db, export, logic
+from . import db, expected_xlsx, export, logic
 
 ADMIN_PIN = os.environ.get("TANAOROSHI_ADMIN_PIN", "1234")
 STATIC = Path(__file__).resolve().parent / "static"
@@ -78,7 +78,7 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
         SELECT i.*, c.name AS category_name, c.locations,
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.total_kg,
                e.case_weight AS entry_case_weight, e.expiry_kind, e.expiry_date, e.mfg_date,
-               e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at,
+               e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
                x.kg AS expected_kg
         FROM items i
         JOIN categories c ON c.id = i.category_id
@@ -117,15 +117,24 @@ def summary(ym: str):
         rows = month_items(con, ym)
         appr = [dict(r) for r in con.execute("SELECT * FROM approvals WHERE ym=?", (ym,))]
     out: dict[int, dict] = {}
+
+    def empty():
+        # counted_from / counted_to = その分類を棚卸した最初と最後の日
+        return {"total": 0, "entered": 0, "warn": 0, "expired": 0, "approvals": {},
+                "counted_from": None, "counted_to": None}
+
     for r in rows:
-        s = out.setdefault(r["category_id"], {"total": 0, "entered": 0, "warn": 0, "expired": 0, "approvals": {}})
+        s = out.setdefault(r["category_id"], empty())
         s["total"] += 1
         if r["entry_id"]:
             s["entered"] += 1
+            day = r["counted_on"]
+            s["counted_from"] = min(s["counted_from"] or day, day)
+            s["counted_to"] = max(s["counted_to"] or day, day)
             if r["status"] in ("warn", "expired"):
                 s[r["status"]] += 1
     for a in appr:
-        out.setdefault(a["category_id"], {"total": 0, "entered": 0, "warn": 0, "expired": 0, "approvals": {}})
+        out.setdefault(a["category_id"], empty())
         out[a["category_id"]]["approvals"][a["role"]] = a["staff_name"]
     return {
         "ym": ym, "month_end": logic.month_end(ym).isoformat(), "ok_limit": logic.ok_limit(ym).isoformat(),
@@ -160,6 +169,19 @@ class EntryIn(BaseModel):
     action: str = ""
     action_date: str | None = None
     action_note: str = ""
+    counted_on: str | None = None  # 棚卸日。None=新規は今日、入力済みは変えない
+
+
+def check_counted_on(s: str | None, before: dict | None) -> str:
+    if not s:
+        return before["counted_on"] if before and before["counted_on"] else date.today().isoformat()
+    try:
+        d = date.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(400, "棚卸日の形式が不正です")
+    if d > date.today():
+        raise HTTPException(400, "棚卸日に未来の日付は入れられません")
+    return d.isoformat()
 
 
 def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
@@ -200,7 +222,7 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
             raise HTTPException(400, "製造日を入れてください")
         new = build_entry(item, ym, body)
         before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
-        new.update(counted_by=user, counted_at=db.now())
+        new.update(counted_by=user, counted_at=db.now(), counted_on=check_counted_on(body.counted_on, before))
         cols = list(new)
         con.execute(
             f"INSERT INTO entries (ym, item_id, {', '.join(cols)}) VALUES (?, ?, {', '.join('?' * len(cols))})"
@@ -209,7 +231,8 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
         )
         after = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
         db.record(con, user, "entry", after["id"], "更新" if before else "入力",
-                  f"{ym} {item['code']} {item['name']} {after['total_kg']}kg 期限{after['expiry_date'] or '-'}",
+                  f"{ym} {item['code']} {item['name']} {after['total_kg']}kg 期限{after['expiry_date'] or '-'}"
+                  f" 棚卸日{after['counted_on']}",
                   before, after)
     return after
 
@@ -337,6 +360,18 @@ def export_xlsx(ym: str):
     )
 
 
+@app.get("/api/months/{ym}/expected.xlsx")
+def expected_template(ym: str):
+    ym = check_ym(ym)
+    with db.connect() as con:
+        data = expected_xlsx.build_template(ym, month_items(con, ym))
+    name = f"予想在庫_{ym}.xlsx"
+    return Response(
+        data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
+
+
 # ---------- 管理者 ----------
 
 @app.post("/api/admin/login")
@@ -378,6 +413,38 @@ def clean_item(body: ItemIn) -> dict:
         raise HTTPException(400, "製造日からの月数を入れてください")
     d["active"] = 1 if d["active"] else 0
     return d
+
+
+@app.post("/api/admin/months/{ym}/expected/import")
+async def import_expected(ym: str, request: Request, user: str = Depends(admin)):
+    """予想在庫のExcelを取り込む。1件でもエラーがあれば何も書き込まない。"""
+    ym = check_ym(ym)
+    data = await request.body()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "ファイルが大きすぎます（10MBまで）")
+    rows, errors = expected_xlsx.parse(data)
+    with db.connect() as con:
+        items = {r["code"]: dict(r) for r in con.execute("SELECT id, code, name FROM items")}
+        errors += [f"{line}行目：コード {code} は品目マスタにありません" for code, (line, _) in rows.items() if code not in items]
+        if errors:
+            return {"ok": False, "errors": errors}
+        current = {r["item_id"]: dict(r) for r in con.execute("SELECT * FROM expected WHERE ym=?", (ym,))}
+        changed = 0
+        for code, (_, kg) in rows.items():
+            item = items[code]
+            before = current.get(item["id"])
+            if before and before["kg"] == kg:
+                continue
+            con.execute(
+                "INSERT INTO expected (ym, item_id, kg, set_by, set_at) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, set_by=excluded.set_by, set_at=excluded.set_at",
+                (ym, item["id"], kg, user, db.now()),
+            )
+            after = db.row_dict(con.execute("SELECT * FROM expected WHERE ym=? AND item_id=?", (ym, item["id"])).fetchone())
+            db.record(con, user, "expected", after["id"], "取込",
+                      f"{ym} {code} {item['name']} 予想{kg}kg", before, after)
+            changed += 1
+    return {"ok": True, "rows": len(rows), "changed": changed, "errors": []}
 
 
 @app.get("/api/admin/items")
@@ -518,7 +585,16 @@ def history(entity: str | None = None, q: str = "", limit: int = 200, _: str = D
 
 # ---------- 画面 ----------
 
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+class NoCacheStatic(StaticFiles):
+    """更新したJS/CSSがタブレットに古いまま残らないよう、毎回サーバーに確認させる（変わっていなければ304）。"""
+
+    async def get_response(self, path, scope):
+        res = await super().get_response(path, scope)
+        res.headers["Cache-Control"] = "no-cache"
+        return res
+
+
+app.mount("/static", NoCacheStatic(directory=STATIC), name="static")
 
 
 @app.get("/")

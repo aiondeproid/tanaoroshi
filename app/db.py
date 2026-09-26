@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS entries (
     action_date TEXT,
     action_note TEXT NOT NULL DEFAULT '',
     counted_by TEXT NOT NULL,
-    counted_at TEXT NOT NULL,
+    counted_at TEXT NOT NULL,         -- 保存した日時（自動）
+    counted_on TEXT,                  -- 棚卸日。初期値は保存した日で、あとから直せる
     UNIQUE (ym, item_id)
 );
 CREATE TABLE IF NOT EXISTS expected (
@@ -102,6 +103,11 @@ def connect() -> sqlite3.Connection:
 def init() -> None:
     with connect() as con:
         con.executescript(SCHEMA)
+        # 棚卸日の列がない古いDBには足して、保存した日で埋める
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(entries)")}
+        if "counted_on" not in cols:
+            con.execute("ALTER TABLE entries ADD COLUMN counted_on TEXT")
+            con.execute("UPDATE entries SET counted_on = substr(counted_at, 1, 10)")
 
 
 def now() -> str:
