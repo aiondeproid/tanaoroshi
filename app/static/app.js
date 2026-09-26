@@ -20,6 +20,10 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n >= 0 ? n : 0; };
 const fmtKg = (v) => (v == null ? "-" : `${Math.round(v * 1000) / 1000}kg`);
 const jdate = (s) => { if (!s) return ""; const [y, m, d] = s.split("-").map(Number); return `${y}/${m}/${d}`; };
+const round3 = (v) => Math.round(v * 1000) / 1000;
+// 実在庫 − 予想在庫。どちらかが無ければ null
+const diffKg = (total, expected) => (total == null || expected == null ? null : round3(total - expected));
+const fmtDiff = (d) => (d == null ? "" : d === 0 ? "差 0kg" : `差 ${d > 0 ? "+" : "−"}${Math.abs(d)}kg`);
 const STATUS = { none: "未入力", ok: "レ", warn: "× 1ヶ月未満", expired: "× 期限切れ" };
 
 function toast(msg, err = false) {
@@ -188,7 +192,8 @@ async function renderCategory(id) {
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
         <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? STATUS[it.status] : "未入力"}</span>
-          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}` : ""}</span>
+          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}` : ""}
+          ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
     $("#items").querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () =>
       openEntry(d.items.find((x) => x.id === Number(b.dataset.id)), d.category, () => renderCategory(id))));
@@ -287,6 +292,10 @@ function openEntry(it, cat, done) {
     ${split ? loc("room", "資材室") + loc("wh", "倉庫／パレット") : loc("room", "在庫")}
     <div class="box"><div class="row"><span class="label">総重量</span><span class="spacer"></span><span class="total" id="total">0kg</span></div>
       <div class="muted" id="formula"></div></div>
+    <div class="box"><div class="label">予想在庫</div>
+      <div class="field"><span>予想</span><input class="num" id="expected_kg" inputmode="decimal" value="${it.expected_kg ?? ""}" placeholder="未入力"> kg
+        <button class="btn small" type="button" id="save-expected">予想だけ保存</button></div>
+      <div class="muted" id="expected_diff"></div></div>
     <div class="box"><div class="label">賞味期限・使用期限</div>
       <div class="seg" id="kind-seg" data-required="1">${["賞", "使", "凍"].map((k) => `<button type="button" data-v="${k}" class="${v.expiry_kind === k ? "on" : ""}">${{ 賞: "賞味期限", 使: "使用期限(開封)", 凍: "冷凍の使用期限" }[k]}</button>`).join("")}</div>
       ${expiryHtml}
@@ -300,11 +309,24 @@ function openEntry(it, cat, done) {
     </div>`);
 
   const val = (id) => $("#" + id)?.value;
+  const expectedValue = () => { const t = val("expected_kg").trim(); return t === "" ? null : num(t); };
+  // 変わっていれば予想在庫を保存する
+  const saveExpected = async () => {
+    const kg = expectedValue();
+    if (kg === (it.expected_kg ?? null)) return false;
+    await api("PUT", `/api/months/${state.ym}/items/${it.id}/expected`, { kg });
+    it.expected_kg = kg;
+    return true;
+  };
   const recalc = () => {
     const cases = num(val("room_cases")) + (split ? num(val("wh_cases")) : 0);
     const loose = num(val("room_kg")) + (split ? num(val("wh_kg")) : 0);
-    const total = Math.round((cases * (cw || 0) + loose) * 1000) / 1000;
+    const total = round3(cases * (cw || 0) + loose);
     $("#total").textContent = `${total}kg`;
+    const exp = expectedValue();
+    const d = diffKg(total, exp);
+    $("#expected_diff").textContent = exp == null ? "入れると総重量との差を表示します" : `総重量 ${total}kg − 予想 ${exp}kg → ${fmtDiff(d)}`;
+    $("#expected_diff").className = d ? "diff-ng" : "muted";
     $("#formula").textContent = cw ? `${cases}ケース × ${cw}kg ＋ 端数 ${loose}kg` : `端数の合計 ${loose}kg`;
     let expiry = null;
     if (it.expiry_mode === "date") expiry = val("expiry_date") || null;
@@ -338,7 +360,11 @@ function openEntry(it, cat, done) {
       expiry_date: val("expiry_date") || null, mfg_date: val("mfg_date") || null,
       action: segValue($("#action-seg")), action_date: val("action_date") || null, action_note: val("action_note") || "",
     };
-    try { await api("PUT", `/api/months/${state.ym}/items/${it.id}`, body); closeSheet(); toast("保存しました"); done(); }
+    try { await saveExpected(); await api("PUT", `/api/months/${state.ym}/items/${it.id}`, body); closeSheet(); toast("保存しました"); done(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $("#save-expected").addEventListener("click", async () => {
+    try { if (await saveExpected()) { toast("予想在庫を保存しました"); done(); } else toast("予想在庫は変わっていません"); }
     catch (e) { toast(e.message, true); }
   });
   recalc();
@@ -381,7 +407,7 @@ async function renderAlerts() {
 
 // ---------- 管理画面 ----------
 const EXPIRY_MODE = { date: "期限を入力", mfg: "製造日から計算", none: "期限指定無し" };
-const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", approval: "確認" };
+const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認" };
 const adminView = { q: "", cat: "", inactive: false, hq: "", hentity: "" };
 
 async function renderAdmin(tab) {

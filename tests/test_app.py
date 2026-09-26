@@ -100,6 +100,22 @@ def test_mfg_expiry(client):
     assert r.json()["expiry_date"] == "2027-02-10"
 
 
+def test_expected_stock(client):
+    it = items(client, "2026-10")["01009"]
+    url = f"/api/months/2026-10/items/{it['id']}/expected"
+    assert it["expected_kg"] is None
+    # 棚卸の入力前でも入れられる
+    assert client.put(url, headers=USER, json={"kg": 45.5}).json()["kg"] == 45.5
+    assert client.put(url, headers=USER, json={"kg": 40}).status_code == 200
+    assert client.put(url, headers=USER, json={"kg": -1}).status_code == 422
+    assert items(client, "2026-10")["01009"]["expected_kg"] == 40
+    assert items(client, "2026-11")["01009"]["expected_kg"] is None  # 月ごと
+    hist = client.get("/api/admin/history?entity=expected", headers=ADMIN).json()
+    assert [h["action"] for h in hist[:2]] == ["更新", "入力"]
+    assert client.put(url, headers=USER, json={"kg": None}).status_code == 200
+    assert items(client, "2026-10")["01009"]["expected_kg"] is None
+
+
 def test_item_change_and_discontinue_are_logged(client):
     it = items(client)["04084"]
     body = {"code": "04084", "name": "アペックス1000", "category_id": client.cat_id, "case_weight": 8, "active": False}

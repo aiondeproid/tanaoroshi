@@ -137,3 +137,5 @@ tr.click:hover { background: #f0f5ff; }
 
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 30; background: #1f2328; color: #fff; padding: 12px 20px; border-radius: 10px; max-width: calc(100% - 32px); }
 .toast.err { background: var(--ng); }
+.expected { font-size: 13px; }
+.diff-ng { color: var(--ng); font-weight: 700; }

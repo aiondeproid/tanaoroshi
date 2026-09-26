@@ -78,13 +78,15 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
         SELECT i.*, c.name AS category_name, c.locations,
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.total_kg,
                e.case_weight AS entry_case_weight, e.expiry_kind, e.expiry_date, e.mfg_date,
-               e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at
+               e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at,
+               x.kg AS expected_kg
         FROM items i
         JOIN categories c ON c.id = i.category_id
         LEFT JOIN entries e ON e.item_id = i.id AND e.ym = ?
+        LEFT JOIN expected x ON x.item_id = i.id AND x.ym = ?
         WHERE (i.active = 1 OR e.id IS NOT NULL)
     """
-    args: list = [ym]
+    args: list = [ym, ym]
     if category_id is not None:
         sql += " AND i.category_id = ?"
         args.append(category_id)
@@ -223,6 +225,32 @@ def delete_entry(ym: str, item_id: int, user: str = Depends(actor)):
         con.execute("DELETE FROM entries WHERE id=?", (before["id"],))
         db.record(con, user, "entry", before["id"], "取消", f"{ym} {item['code']} {item['name']}", before, None)
     return {"ok": True}
+
+
+class ExpectedIn(BaseModel):
+    kg: float | None = Field(None, ge=0)  # None=予想在庫を消す
+
+
+@app.put("/api/months/{ym}/items/{item_id}/expected")
+def save_expected(ym: str, item_id: int, body: ExpectedIn, user: str = Depends(actor)):
+    ym = check_ym(ym)
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        before = db.row_dict(con.execute("SELECT * FROM expected WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        if body.kg is None:
+            if before:
+                con.execute("DELETE FROM expected WHERE id=?", (before["id"],))
+                db.record(con, user, "expected", before["id"], "取消", f"{ym} {item['code']} {item['name']}", before, None)
+            return {"kg": None}
+        con.execute(
+            "INSERT INTO expected (ym, item_id, kg, set_by, set_at) VALUES (?,?,?,?,?)"
+            " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, set_by=excluded.set_by, set_at=excluded.set_at",
+            (ym, item_id, body.kg, user, db.now()),
+        )
+        after = db.row_dict(con.execute("SELECT * FROM expected WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        db.record(con, user, "expected", after["id"], "更新" if before else "入力",
+                  f"{ym} {item['code']} {item['name']} 予想{after['kg']}kg", before, after)
+    return after
 
 
 class ActionIn(BaseModel):

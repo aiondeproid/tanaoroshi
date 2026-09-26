@@ -1,19 +1,27 @@
 @echo off
-chcp 65001 > nul
-rem 原料棚卸アプリを起動する。止めるときはこの画面で Ctrl+C。
-cd /d %~dp0
-if not exist .venv (
-  echo 初回セットアップ中...
-  python -m venv .venv || goto :error
-  .venv\Scripts\python -m pip install -r requirements.txt || goto :error
+rem Start the tanaoroshi (inventory) web app. Press Ctrl+C to stop.
+rem Keep this file ASCII-only with CRLF line endings (cmd.exe misreads UTF-8/LF).
+cd /d "%~dp0"
+
+if not exist ".venv\Scripts\python.exe" (
+  echo First-time setup: installing libraries...
+  python -m venv .venv
+  if errorlevel 1 goto error
+  ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+  if errorlevel 1 goto error
 )
-rem 管理者PIN。必ず変更すること
+
+rem Admin PIN. Change this before real use.
 if "%TANAOROSHI_ADMIN_PIN%"=="" set TANAOROSHI_ADMIN_PIN=1234
+
 echo.
-echo タブレット・スマホから http://%COMPUTERNAME%:8000 を開いてください
+echo Open  http://%COMPUTERNAME%:8000  on a tablet or phone.
+echo Press Ctrl+C to stop.
 echo.
-.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+".venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+pause
 goto :eof
+
 :error
-echo セットアップに失敗しました
+echo Setup failed. Check that Python is installed and on PATH.
 pause

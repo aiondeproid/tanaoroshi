@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS entries (
     counted_at TEXT NOT NULL,
     UNIQUE (ym, item_id)
 );
+CREATE TABLE IF NOT EXISTS expected (
+    id INTEGER PRIMARY KEY,
+    ym TEXT NOT NULL,                 -- 棚卸月 YYYY-MM
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    kg REAL NOT NULL,                 -- 予想在庫（総重量と比べる）
+    set_by TEXT NOT NULL,
+    set_at TEXT NOT NULL,
+    UNIQUE (ym, item_id)
+);
 CREATE TABLE IF NOT EXISTS approvals (
     id INTEGER PRIMARY KEY,
     ym TEXT NOT NULL,
