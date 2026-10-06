@@ -237,7 +237,7 @@ def test_item_change_and_discontinue_are_logged(client):
     assert client.put(f"/api/admin/items/{it['id']}", headers=ADMIN, json=body).status_code == 200
     hist = client.get("/api/admin/history?entity=item", headers=ADMIN).json()
     assert hist[0]["action"] == "終売"
-    assert "ケース重量: 7.0 → 8.0" in hist[0]["summary"]
+    assert "ケース重量: 7 → 8" in hist[0]["summary"]
     # 終売でも、入力済みの月には残る。未入力の月には出ない
     assert "04084" in items(client, "2026-09")
     assert "04084" not in items(client, "2030-01")
@@ -271,3 +271,51 @@ def test_export_xlsx(client):
     col = heads.index("棚卸日") + 1
     row = codes.index("04084") + 7
     assert ws.cell(row=row, column=col).value == f"{today.year}/{today.month}/{today.day}"
+
+
+def test_items_excel_round_trip(client):
+    assert client.get("/api/admin/items.xlsx", headers=USER).status_code == 403
+    r = client.get("/api/admin/items.xlsx", headers=ADMIN)
+    assert r.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(r.content))
+    ws = wb["品目"]
+    heads = [c.value for c in ws[3]]
+    col = {h: i + 1 for i, h in enumerate(heads)}
+    rows = {ws.cell(row=i, column=1).value: i for i in range(4, ws.max_row + 1)}
+    assert set(rows) == {"04084", "01009"}
+    assert ws.cell(row=rows["01009"], column=col["期限の種類"]).value == "製造日から計算"
+    url = "/api/admin/items/import"
+    # そのまま戻しても何も変わらない
+    buf = io.BytesIO(); wb.save(buf)
+    r = client.post(url, headers=ADMIN, content=buf.getvalue()).json()
+    assert r["ok"] and r["changes"] == []
+
+    ws.cell(row=rows["01009"], column=col["1パレットのケース数"], value=50)
+    ws.cell(row=rows["01009"], column=col["ケース重量(kg)"]).value = None  # 空欄=未設定
+    assert ws.cell(row=rows["04084"], column=col["状態"]).value == "終売"  # 前のテストで終売にした
+    ws.cell(row=rows["04084"], column=col["状態"], value="有効")
+    new = ws.max_row + 1
+    for h, v in {"コード": 2001, "品名": "新しい粉", "分類": "植蛋 / 植蛋", "保管": "冷蔵", "期限の種類": "期限指定無し"}.items():
+        ws.cell(row=new, column=col[h], value=v)
+    buf = io.BytesIO(); wb.save(buf)
+    data = buf.getvalue()
+    r = client.post(url, headers=ADMIN, content=data).json()  # 確認だけ
+    assert r["ok"] and (r["added"], r["changed"]) == (1, 2)
+    assert {c["code"]: c["kind"] for c in r["changes"]} == {"01009": "変更", "04084": "変更", "02001": "追加"}
+    assert items(client, "2026-06")["01009"]["case_weight"] == 20  # まだ反映しない
+    r = client.post(url + "?apply=1", headers=ADMIN, content=data).json()
+    assert r["ok"] and r["applied"]
+    master = {i["code"]: i for i in client.get("/api/admin/items", headers=ADMIN).json()}
+    assert master["01009"]["pallet_cases"] == 50 and master["01009"]["case_weight"] is None
+    assert master["04084"]["active"] == 1
+    assert master["02001"]["storage"] == "冷蔵" and master["02001"]["expiry_mode"] == "none"
+    hist = client.get("/api/admin/history?entity=item", headers=ADMIN).json()
+    assert {"取込追加", "取込変更"} <= {h["action"] for h in hist}
+
+    # エラーが1件でもあれば何も変えない
+    bad = xlsx([["コード", "品名", "保管", "ケース重量(kg)"], ["01009", "上白糖", "冷蔵", 5], ["01009", "", "常温", None],
+                ["9999", "分類なし", "常温", 1], ["02001", "", "地下", "重い"]])
+    r = client.post(url + "?apply=1", headers=ADMIN, content=bad).json()
+    assert not r["ok"] and len(r["errors"]) == 4
+    master2 = {i["code"]: i for i in client.get("/api/admin/items", headers=ADMIN).json()}
+    assert master2["01009"] == master["01009"]

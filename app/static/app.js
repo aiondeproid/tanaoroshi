@@ -41,6 +41,21 @@ function toast(msg, err = false) {
   toast.timer = setTimeout(() => (t.hidden = true), err ? 5000 : 2200);
 }
 
+// 管理者PINが要るファイルは <a href> では落とせないので、fetch してから保存させる
+async function download(path, fallbackName) {
+  const headers = {};
+  if (state.user) headers["X-User"] = encodeURIComponent(state.user);
+  if (state.pin) headers["X-Admin-Pin"] = state.pin;
+  const res = await fetch(path, { headers });
+  if (!res.ok) throw new Error(`ダウンロードできませんでした (${res.status})`);
+  const m = /filename\*=UTF-8''([^;]+)/.exec(res.headers.get("Content-Disposition") || "");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await res.blob());
+  a.download = m ? decodeURIComponent(m[1]) : fallbackName;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
 async function api(method, path, body, raw = false) {
   const headers = { "Content-Type": raw ? "application/octet-stream" : "application/json" };
   if (state.user) headers["X-User"] = encodeURIComponent(state.user);
@@ -567,6 +582,8 @@ async function adminItems() {
       <select id="acat"><option value="">すべての分類</option>${cats.map((c) => `<option value="${c.id}" ${String(c.id) === adminView.cat ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select>
       <label class="row"><input type="checkbox" id="ainactive" ${adminView.inactive ? "checked" : ""}>終売も表示</label>
       <button class="btn primary" id="add">＋ 品目を追加</button></div>
+    <div class="row" style="margin-top:8px"><button class="btn" id="xout">Excelで出力</button>
+      <button class="btn" id="xin">Excelで一括変更</button></div>
     <p class="muted" id="acount"></p>
     <div class="table-wrap"><table><thead><tr><th>コード</th><th>品名</th><th>分類</th><th>保管</th><th>ケース重量</th><th>パレット</th><th>期限</th><th>状態</th></tr></thead><tbody id="arows"></tbody></table></div>`;
   const draw = () => {
@@ -584,7 +601,58 @@ async function adminItems() {
   $("#acat").addEventListener("change", (e) => { adminView.cat = e.target.value; draw(); });
   $("#ainactive").addEventListener("change", (e) => { adminView.inactive = e.target.checked; draw(); });
   $("#add").addEventListener("click", () => itemForm(null, cats));
+  $("#xout").addEventListener("click", () => download("/api/admin/items.xlsx", "品目マスタ.xlsx").catch((e) => toast(e.message, true)));
+  $("#xin").addEventListener("click", itemsImport);
   draw();
+}
+
+// 品目マスタをExcelでまとめて変える。先に変更内容を見せて、確認してから反映する
+function itemsImport() {
+  openSheet(`<h3>Excelで品目を一括変更</h3>
+    <ol class="steps" style="margin-top:12px">
+      <li>「Excelで出力」で今の品目マスタをダウンロードする</li>
+      <li>変えたい所を書き換えて保存する。新しいコードの行は品目の追加になります。行を消しても品目は消えません（終売は「状態」で）</li>
+      <li>ファイルを選んで「内容を確認」→ 変更内容を見てから「反映する」</li>
+    </ol>
+    <div class="row"><input type="file" id="i_file" accept=".xlsx"><button class="btn" id="i_check">内容を確認</button></div>
+    <div id="i_result"></div>
+    <div class="actions-bar"><button class="btn" id="close">閉じる</button>
+      <button class="btn primary" id="i_apply" disabled>反映する</button></div>`);
+  const out = $("#i_result");
+  let data = null;
+  const send = async (apply) => api("POST", `/api/admin/items/import${apply ? "?apply=1" : ""}`, data, true);
+  const table = (changes) => `<div class="table-wrap" style="margin-top:8px;max-height:45vh;overflow:auto"><table>
+    <thead><tr><th>行</th><th>コード</th><th>品名</th><th>種類</th><th>変更内容</th></tr></thead>
+    <tbody>${changes.map((c) => `<tr><td>${c.line}</td><td>${esc(c.code)}</td><td>${esc(c.name)}</td><td>${esc(c.kind)}</td><td>${esc(c.detail)}</td></tr>`).join("")}</tbody></table></div>`;
+  $("#i_file").addEventListener("change", () => { data = null; out.innerHTML = ""; $("#i_apply").disabled = true; });
+  $("#close").addEventListener("click", () => { closeSheet(); adminItems(); });
+  $("#i_check").addEventListener("click", async () => {
+    const f = $("#i_file").files[0];
+    if (!f) return toast("ファイルを選んでください", true);
+    $("#i_apply").disabled = true;
+    try {
+      data = await f.arrayBuffer();
+      const r = await send(false);
+      if (!r.ok) {
+        out.innerHTML = `<div class="notice"><b>取り込めません（${r.errors.length}件のエラー）。直してからもう一度選んでください。</b>
+          <ul>${r.errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul></div>`;
+      } else if (!r.changes.length) {
+        out.innerHTML = `<div class="banner ok">${r.rows}件を読み込みました。変わる所はありません</div>`;
+      } else {
+        out.innerHTML = `<div class="banner warn">${r.rows}件を読み込みました。追加 ${r.added}件・変更 ${r.changed}件です。よければ「反映する」を押してください</div>${table(r.changes)}`;
+        $("#i_apply").disabled = false;
+      }
+    } catch (e) { toast(e.message, true); }
+  });
+  $("#i_apply").addEventListener("click", async () => {
+    $("#i_apply").disabled = true;
+    try {
+      const r = await send(true);
+      if (!r.ok) { toast("取り込めませんでした。もう一度「内容を確認」してください", true); return; }
+      closeSheet(); toast(`追加 ${r.added}件・変更 ${r.changed}件を反映しました`);
+      state.meta = await api("GET", "/api/meta"); adminItems();
+    } catch (e) { toast(e.message, true); $("#i_apply").disabled = false; }
+  });
 }
 
 function itemForm(it, cats) {

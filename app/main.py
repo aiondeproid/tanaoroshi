@@ -9,9 +9,9 @@ from urllib.parse import quote, unquote
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from . import db, expected_xlsx, export, logic
+from . import db, expected_xlsx, export, items_xlsx, logic
 
 ADMIN_PIN = os.environ.get("TANAOROSHI_ADMIN_PIN", "1234")
 STATIC = Path(__file__).resolve().parent / "static"
@@ -412,8 +412,17 @@ ITEM_LABEL = {"code": "コード", "name": "品名", "category_id": "分類", "s
               "active": "有効"}
 
 
+def show_value(v) -> str:
+    if v is None or v == "":
+        return "未設定"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def diff_summary(before: dict, after: dict, labels: dict) -> str:
-    parts = [f"{labels[k]}: {before.get(k)} → {after.get(k)}" for k in labels if before.get(k) != after.get(k)]
+    parts = [f"{labels[k]}: {show_value(before.get(k))} → {show_value(after.get(k))}"
+             for k in labels if before.get(k) != after.get(k)]
     return " / ".join(parts)
 
 
@@ -496,6 +505,76 @@ def update_item(item_id: int, body: ItemIn, user: str = Depends(admin)):
             action = "終売" if before["active"] and not after["active"] else "変更"
             db.record(con, user, "item", item_id, action, f"{after['code']} {after['name']}：{change}", before, after)
     return after
+
+
+@app.get("/api/admin/items.xlsx")
+def export_items(_: str = Depends(admin)):
+    with db.connect() as con:
+        cats = [dict(r) for r in con.execute("SELECT * FROM categories ORDER BY sort")]
+        items = [dict(r) for r in con.execute(
+            "SELECT i.* FROM items i JOIN categories c ON c.id=i.category_id ORDER BY c.sort, i.sort, i.code")]
+    data = items_xlsx.build(items, cats, STORAGES)
+    name = f"品目マスタ_{date.today():%Y%m%d}.xlsx"
+    return Response(
+        data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
+
+
+@app.post("/api/admin/items/import")
+async def import_items(request: Request, apply: bool = False, user: str = Depends(admin)):
+    """品目マスタのExcelを取り込む。apply=false なら変更内容を返すだけ。1件でもエラーがあれば何も書き込まない。"""
+    data = await request.body()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "ファイルが大きすぎます（10MBまで）")
+    with db.connect() as con:
+        cats = [dict(r) for r in con.execute("SELECT * FROM categories ORDER BY sort")]
+        rows, errors = items_xlsx.parse(data, cats, STORAGES)
+        current = {r["code"]: dict(r) for r in con.execute("SELECT * FROM items")}
+        cat_name = {c["id"]: items_xlsx.category_label(c) for c in cats}
+        plan = []  # (行, 変更前 or None, 変更後)
+        for row in rows:
+            before = current.get(row["code"])
+            base = ({k: before[k] for k in ItemIn.model_fields} if before
+                    else {"code": row["code"], "storage": "常温", "expiry_mode": "date", "note": "", "sort": 0, "active": True})
+            merged = {**base, **row["values"]}
+            if not before and not {"name", "category_id"} <= merged.keys():
+                errors.append(f"{row['line']}行目（{row['code']}）：新しい品目には品名と分類が必要です")
+                continue
+            try:
+                d = clean_item(ItemIn(**merged))
+            except HTTPException as e:
+                errors.append(f"{row['line']}行目（{row['code']}）：{e.detail}")
+                continue
+            except ValidationError:
+                errors.append(f"{row['line']}行目（{row['code']}）：入力内容を確認してください")
+                continue
+            if before is None or any(before[k] != d[k] for k in d):
+                plan.append((row, before, d))
+        if errors:
+            return {"ok": False, "rows": len(rows), "errors": errors, "changes": []}
+
+        def show(d: dict) -> dict:
+            return {**d, "category_id": cat_name.get(d["category_id"], d["category_id"])}
+
+        changes = [{"line": row["line"], "code": d["code"], "name": d["name"], "kind": "変更" if before else "追加",
+                    "detail": diff_summary(show(before), show(d), ITEM_LABEL) if before else ""}
+                   for row, before, d in plan]
+        if apply:
+            for row, before, d in plan:
+                if before:
+                    con.execute(f"UPDATE items SET {', '.join(f'{k}=?' for k in d)} WHERE id=?", [*d.values(), before["id"]])
+                    after = get_item(con, before["id"])
+                    action = "終売" if before["active"] and not after["active"] else "変更"
+                    db.record(con, user, "item", before["id"], f"取込{action}",
+                              f"{after['code']} {after['name']}：{diff_summary(show(before), show(after), ITEM_LABEL)}",
+                              before, after)
+                else:
+                    cur = con.execute(f"INSERT INTO items ({', '.join(d)}) VALUES ({', '.join('?' * len(d))})", list(d.values()))
+                    after = get_item(con, cur.lastrowid)
+                    db.record(con, user, "item", cur.lastrowid, "取込追加", f"{d['code']} {d['name']}", None, after)
+    return {"ok": True, "applied": apply, "rows": len(rows), "errors": [], "changes": changes,
+            "added": sum(c["kind"] == "追加" for c in changes), "changed": sum(c["kind"] == "変更" for c in changes)}
 
 
 class CategoryIn(BaseModel):
