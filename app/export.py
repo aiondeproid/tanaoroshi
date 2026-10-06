@@ -102,7 +102,7 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
         cell(ws, 3, 1, rule)
 
         # 確認欄（右上）
-        start = 12 if split else 10
+        start = 13 if split else 10
         for i, role in enumerate(roles):
             a = appr.get((cat["id"], role))
             cell(ws, 1, start + i, role, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
@@ -110,16 +110,17 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
             cell(ws, 2, start + i, txt, border=BORDER, alignment=CENTER)
         ws.row_dimensions[2].height = 45
 
-        loc_heads = (["資材室", "", "倉庫/パレット", ""] if split else ["在庫", ""])
+        loc_heads = (["資材室", "", "倉庫/パレット", "", ""] if split else ["在庫", ""])
         heads = ["コード", "品名", "保管", "ケース重量(kg)", *loc_heads, "総重量(kg)", "区分",
                  "賞味期限/使用期限", "チェック(レ・×)", "対応", "対応メモ", "担当者", "棚卸日"]
-        sub = ["", "", "", "", *(["ケース", "端数kg"] * (2 if split else 1)), "", "", "", "", "", "", "", ""]
+        loc_sub = ["ケース", "端数kg", "パレット", "ケース", "端数kg"] if split else ["ケース", "端数kg"]
+        sub = ["", "", "", "", *loc_sub, "", "", "", "", "", "", "", ""]
         for i, (h, s) in enumerate(zip(heads, sub), 1):
             cell(ws, 5, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
             cell(ws, 6, i, s, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
         ws.merge_cells(start_row=5, start_column=5, end_row=5, end_column=6)
         if split:
-            ws.merge_cells(start_row=5, start_column=7, end_row=5, end_column=8)
+            ws.merge_cells(start_row=5, start_column=7, end_row=5, end_column=9)
         for i, h in enumerate(heads, 1):
             if h and not sub[i - 1]:
                 ws.merge_cells(start_row=5, start_column=i, end_row=6, end_column=i)
@@ -127,8 +128,8 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
         r = 7
         for it in items:
             entered = it["entry_id"] is not None
-            loc = ([it["room_cases"], it["room_kg"], it["wh_cases"], it["wh_kg"]] if split
-                   else [it["room_cases"], it["room_kg"]]) if entered else [None] * (4 if split else 2)
+            loc = ([it["room_cases"], it["room_kg"], it["wh_pallets"], it["wh_cases"], it["wh_kg"]] if split
+                   else [it["room_cases"], it["room_kg"]]) if entered else [None] * len(loc_sub)
             expiry = jdate(it["expiry_date"]) or (MODE_NOTE.get(it["expiry_mode"], "") if entered else "")
             if it["mfg_date"]:
                 expiry += f"\n(製造日{jdate(it['mfg_date'])})"
@@ -139,12 +140,12 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
                     it["counted_by"] or "", jdate(it["counted_on"])]
             fill = {"warn": WARN_FILL, "expired": EXPIRED_FILL}.get(it["status"]) if entered else None
             for i, v in enumerate(vals, 1):
-                x = cell(ws, r, i, v, border=BORDER, alignment=WRAP if i in (2, 14 if split else 12) else CENTER)
+                x = cell(ws, r, i, v, border=BORDER, alignment=WRAP if i in (2, 15 if split else 12) else CENTER)
                 if fill:
                     x.fill = fill
             r += 1
 
-        widths = [10, 30, 6, 9, *([7, 8] * (2 if split else 1)), 10, 5, 13, 11, 14, 22, 9, 11]
+        widths = [10, 30, 6, 9, *([7, 8, 7, 7, 8] if split else [7, 8]), 10, 5, 13, 11, 14, 22, 9, 11]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "C7"

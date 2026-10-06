@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS items (
     category_id INTEGER NOT NULL REFERENCES categories(id),
     storage TEXT NOT NULL DEFAULT '常温',      -- 常温/冷蔵/冷凍
     case_weight REAL,                         -- kg。NULL=未設定
+    pallet_cases REAL,                        -- 1パレットに載るケース数。NULL=未設定
     expiry_mode TEXT NOT NULL DEFAULT 'date', -- date=期限を入力 / mfg=製造日+月数 / none=期限指定なし
     mfg_months INTEGER,
     note TEXT NOT NULL DEFAULT '',
@@ -42,9 +43,11 @@ CREATE TABLE IF NOT EXISTS entries (
     room_kg REAL NOT NULL DEFAULT 0,  -- 端数
     wh_cases REAL NOT NULL DEFAULT 0,
     wh_kg REAL NOT NULL DEFAULT 0,
+    wh_pallets REAL NOT NULL DEFAULT 0,  -- 倉庫のパレット数
     room_kg_parts TEXT,               -- 端数の内訳（JSON配列、合計が room_kg）
     wh_kg_parts TEXT,                 -- 端数の内訳（JSON配列、合計が wh_kg）
     case_weight REAL,                 -- 入力時点のケース重量
+    pallet_cases REAL,                -- 入力時点の1パレットのケース数
     total_kg REAL NOT NULL DEFAULT 0,
     expiry_kind TEXT NOT NULL DEFAULT '賞',  -- 賞/使/凍
     expiry_date TEXT,
@@ -114,6 +117,13 @@ def init() -> None:
         for c in ("room_kg_parts", "wh_kg_parts"):
             if c not in cols:
                 con.execute(f"ALTER TABLE entries ADD COLUMN {c} TEXT")
+        # パレットの列がない古いDBには足す
+        if "wh_pallets" not in cols:
+            con.execute("ALTER TABLE entries ADD COLUMN wh_pallets REAL NOT NULL DEFAULT 0")
+        if "pallet_cases" not in cols:
+            con.execute("ALTER TABLE entries ADD COLUMN pallet_cases REAL")
+        if "pallet_cases" not in {r["name"] for r in con.execute("PRAGMA table_info(items)")}:
+            con.execute("ALTER TABLE items ADD COLUMN pallet_cases REAL")
 
 
 def now() -> str:

@@ -100,6 +100,27 @@ def test_loose_kg_parts_are_summed_and_kept(client):
     assert bad.status_code == 422
 
 
+def test_pallets_count_as_cases(client):
+    it = items(client, "2026-07")["04084"]
+    far = logic.add_months(date.today(), 3).isoformat()
+    body = {"room_cases": 1, "wh_pallets": 2, "wh_cases": 3, "wh_kg_parts": [0.5, 0, 0], "expiry_kind": "賞", "expiry_date": far}
+    # 1パレットのケース数が未設定ならパレットは入れられない
+    r = client.put(f"/api/months/2026-07/items/{it['id']}", headers=USER, json=body)
+    assert r.status_code == 400
+    master = {k: it[k] for k in ("code", "name", "category_id", "storage", "case_weight", "expiry_mode", "mfg_months", "note", "sort")}
+    r = client.put(f"/api/admin/items/{it['id']}", headers=ADMIN, json={**master, "pallet_cases": 40})
+    assert r.status_code == 200, r.text
+    r = client.put(f"/api/months/2026-07/items/{it['id']}", headers=USER, json=body)
+    assert r.status_code == 200, r.text
+    e = r.json()
+    assert e["wh_pallets"] == 2 and e["pallet_cases"] == 40
+    assert e["total_kg"] == (1 + 3 + 2 * 40) * 7 + 0.5
+    ws = openpyxl.load_workbook(io.BytesIO(client.get("/api/months/2026-07/export.xlsx").content))["植蛋"]
+    assert [ws.cell(row=6, column=c).value for c in range(5, 10)] == ["ケース", "端数kg", "パレット", "ケース", "端数kg"]
+    row = [ws.cell(row=r, column=1).value for r in range(7, ws.max_row + 1)].index("04084") + 7
+    assert [ws.cell(row=row, column=c).value for c in range(5, 10)] == [1, 0, 2, 3, 0.5]
+
+
 def test_expired_entry_shows_in_alerts_and_action(client):
     ym = date.today().strftime("%Y-%m")
     it = items(client, ym)["04084"]

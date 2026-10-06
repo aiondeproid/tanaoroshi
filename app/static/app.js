@@ -343,19 +343,25 @@ const segValue = (el) => el.querySelector("button.on")?.dataset.v || "";
 function openEntry(it, cat, done) {
   const split = cat.locations === "split";
   const cw = it.entry_id ? it.entry_case_weight ?? it.case_weight : it.case_weight;
-  const v = it.entry_id ? it : { room_cases: 0, room_kg: 0, wh_cases: 0, wh_kg: 0, expiry_kind: "賞" };
+  const pc = it.pallet_cases; // 1パレットのケース数（保存時はマスタの値で計算する）
+  const v = it.entry_id ? it : { room_cases: 0, room_kg: 0, wh_cases: 0, wh_kg: 0, wh_pallets: 0, expiry_kind: "賞" };
   // 端数は3か所に分けて入れる。内訳がない古い入力は合計を1つ目に入れる
   const KG_PARTS = 3;
   const kgParts = (key) => {
     const parts = v[key + "_kg_parts"] ? JSON.parse(v[key + "_kg_parts"]) : [v[key + "_kg"] || 0];
     return Array.from({ length: KG_PARTS }, (_, i) => parts[i] || 0);
   };
+  const stepper = (id) => `<div class="stepper"><button type="button" data-step="${id}" data-d="-1">−</button>
+          <input id="${id}" inputmode="decimal" value="${v[id] || 0}">
+          <button type="button" data-step="${id}" data-d="1">＋</button></div>`;
+  // 倉庫だけパレットも数える。1パレットのケース数が未設定の品目は出さない
+  const pallet = (key) => key !== "wh" ? "" : pc
+    ? `<div class="field"><span>パレット</span>${stepper("wh_pallets")}<span class="muted">× ${pc}ケース</span></div>`
+    : `<div class="muted">1パレットのケース数が未設定のため、パレットは入力できません（管理画面で設定）</div>`;
   const loc = (key, label) => `
     <div class="box"><div class="label">${label}</div>
-      <div class="field"><span>ケース</span>
-        <div class="stepper"><button type="button" data-step="${key}_cases" data-d="-1">−</button>
-          <input id="${key}_cases" inputmode="decimal" value="${v[key + "_cases"] || 0}">
-          <button type="button" data-step="${key}_cases" data-d="1">＋</button></div></div>
+      ${pallet(key)}
+      <div class="field"><span>ケース</span>${stepper(key + "_cases")}</div>
       <div class="field"><span>端数</span><div class="kg-parts">${kgParts(key).map((x, i) =>
         `<input class="num" id="${key}_kg${i}" inputmode="decimal" value="${x || ""}" placeholder="0">`).join("")}</div> kg</div>
     </div>`;
@@ -405,7 +411,8 @@ function openEntry(it, cat, done) {
     return true;
   };
   const recalc = () => {
-    const cases = num(val("room_cases")) + (split ? num(val("wh_cases")) : 0);
+    const pallets = split && pc ? num(val("wh_pallets")) : 0;
+    const cases = round3(num(val("room_cases")) + (split ? num(val("wh_cases")) : 0) + pallets * pc);
     const loose = round3(kgOf("room") + (split ? kgOf("wh") : 0));
     const total = round3(cases * (cw || 0) + loose);
     $("#total").textContent = `${total}kg`;
@@ -413,7 +420,8 @@ function openEntry(it, cat, done) {
     const d = diffKg(total, exp);
     $("#expected_diff").textContent = exp == null ? "入れると総重量との差を表示します" : `総重量 ${total}kg − 予想 ${exp}kg → ${fmtDiff(d)}`;
     $("#expected_diff").className = d ? "diff-ng" : "muted";
-    $("#formula").textContent = cw ? `${cases}ケース × ${cw}kg ＋ 端数 ${loose}kg` : `端数の合計 ${loose}kg`;
+    const pl = pallets ? `（うちパレット ${pallets}枚 × ${pc}ケース）` : "";
+    $("#formula").textContent = cw ? `${cases}ケース${pl} × ${cw}kg ＋ 端数 ${loose}kg` : `端数の合計 ${loose}kg`;
     let expiry = null;
     if (it.expiry_mode === "date") expiry = val("expiry_date") || null;
     if (it.expiry_mode === "mfg" && val("mfg_date")) { expiry = addMonths(val("mfg_date"), it.mfg_months); $("#calc_expiry").textContent = jdate(expiry); }
@@ -441,7 +449,7 @@ function openEntry(it, cat, done) {
   $("#save").addEventListener("click", async () => {
     const body = {
       room_cases: num(val("room_cases")), room_kg: kgOf("room"), room_kg_parts: partsOf("room"),
-      wh_cases: split ? num(val("wh_cases")) : 0, wh_kg: split ? kgOf("wh") : 0, wh_kg_parts: split ? partsOf("wh") : null,
+      wh_cases: split ? num(val("wh_cases")) : 0, wh_pallets: split && pc ? num(val("wh_pallets")) : 0, wh_kg: split ? kgOf("wh") : 0, wh_kg_parts: split ? partsOf("wh") : null,
       expiry_kind: segValue($("#kind-seg")) || "賞",
       expiry_date: val("expiry_date") || null, mfg_date: val("mfg_date") || null,
       action: segValue($("#action-seg")), action_date: val("action_date") || null, action_note: val("action_note") || "",
@@ -560,7 +568,7 @@ async function adminItems() {
       <label class="row"><input type="checkbox" id="ainactive" ${adminView.inactive ? "checked" : ""}>終売も表示</label>
       <button class="btn primary" id="add">＋ 品目を追加</button></div>
     <p class="muted" id="acount"></p>
-    <div class="table-wrap"><table><thead><tr><th>コード</th><th>品名</th><th>分類</th><th>保管</th><th>ケース重量</th><th>期限</th><th>状態</th></tr></thead><tbody id="arows"></tbody></table></div>`;
+    <div class="table-wrap"><table><thead><tr><th>コード</th><th>品名</th><th>分類</th><th>保管</th><th>ケース重量</th><th>パレット</th><th>期限</th><th>状態</th></tr></thead><tbody id="arows"></tbody></table></div>`;
   const draw = () => {
     const q = adminView.q.trim().toLowerCase();
     const rows = items.filter((i) => (adminView.inactive || i.active) && (!adminView.cat || String(i.category_id) === adminView.cat)
@@ -568,6 +576,7 @@ async function adminItems() {
     $("#acount").textContent = `${rows.length} 件`;
     $("#arows").innerHTML = rows.map((i) => `<tr class="click" data-id="${i.id}"><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category_name)}</td>
       <td>${esc(i.storage)}</td><td>${i.case_weight == null ? `<span style="color:var(--ng)">未設定</span>` : i.case_weight + "kg"}</td>
+      <td>${i.pallet_cases == null ? `<span class="muted">-</span>` : i.pallet_cases + "ケース"}</td>
       <td>${esc(EXPIRY_MODE[i.expiry_mode])}${i.expiry_mode === "mfg" ? `+${i.mfg_months}ヶ月` : ""}</td><td>${i.active ? "有効" : `<span style="color:var(--ng)">終売</span>`}</td></tr>`).join("");
     el.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => itemForm(items.find((x) => x.id === Number(tr.dataset.id)), cats)));
   };
@@ -579,7 +588,7 @@ async function adminItems() {
 }
 
 function itemForm(it, cats) {
-  const v = it || { code: "", name: "", category_id: Number(adminView.cat) || cats[0]?.id, storage: "常温", case_weight: null, expiry_mode: "date", mfg_months: null, note: "", sort: 0, active: 1 };
+  const v = it || { code: "", name: "", category_id: Number(adminView.cat) || cats[0]?.id, storage: "常温", case_weight: null, pallet_cases: null, expiry_mode: "date", mfg_months: null, note: "", sort: 0, active: 1 };
   openSheet(`<h3>${it ? "品目を変更" : "品目を追加"}</h3>
     <div class="form-grid" style="margin-top:12px">
       <label>コード<input class="text" id="f_code" value="${esc(v.code)}"></label>
@@ -587,6 +596,7 @@ function itemForm(it, cats) {
       <label>分類<select id="f_cat">${cats.map((c) => `<option value="${c.id}" ${c.id === v.category_id ? "selected" : ""}>${esc(c.grp)} / ${esc(c.name)}</option>`).join("")}</select></label>
       <label>保管（未開封時）<select id="f_storage">${state.meta.storages.map((s) => `<option ${s === v.storage ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label>ケース重量(kg)<input class="text" id="f_cw" inputmode="decimal" value="${v.case_weight ?? ""}" placeholder="空欄=未設定"></label>
+      <label>1パレットのケース数<input class="text" id="f_pc" inputmode="decimal" value="${v.pallet_cases ?? ""}" placeholder="空欄=未設定（パレットを数えない）"></label>
       <label>期限の種類<select id="f_mode">${Object.entries(EXPIRY_MODE).map(([k, l]) => `<option value="${k}" ${k === v.expiry_mode ? "selected" : ""}>${l}</option>`).join("")}</select></label>
       <label id="f_months_wrap">製造日からの月数<input class="text" id="f_months" inputmode="numeric" value="${v.mfg_months ?? ""}"></label>
       <label>メモ<input class="text" id="f_note" value="${esc(v.note)}"></label>
@@ -600,13 +610,15 @@ function itemForm(it, cats) {
   $("#close").addEventListener("click", closeSheet);
   $("#save").addEventListener("click", async () => {
     const cw = $("#f_cw").value.trim();
+    const pcv = $("#f_pc").value.trim();
     const body = {
       code: $("#f_code").value, name: $("#f_name").value, category_id: Number($("#f_cat").value), storage: $("#f_storage").value,
-      case_weight: cw === "" ? null : Number(cw), expiry_mode: $("#f_mode").value,
+      case_weight: cw === "" ? null : Number(cw), pallet_cases: pcv === "" ? null : Number(pcv), expiry_mode: $("#f_mode").value,
       mfg_months: $("#f_months").value ? Number($("#f_months").value) : null, note: $("#f_note").value,
       sort: Number($("#f_sort").value) || 0, active: $("#f_active").value === "1",
     };
     if (cw !== "" && !Number.isFinite(body.case_weight)) return toast("ケース重量は数字で入れてください", true);
+    if (pcv !== "" && !(body.pallet_cases > 0)) return toast("1パレットのケース数は0より大きい数字で入れてください", true);
     try {
       await api(it ? "PUT" : "POST", it ? `/api/admin/items/${it.id}` : "/api/admin/items", body);
       closeSheet(); toast("保存しました"); state.meta = await api("GET", "/api/meta"); adminItems();

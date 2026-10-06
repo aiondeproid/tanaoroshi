@@ -77,8 +77,8 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
     """その月に数える品目（有効な品目＋その月に入力済みの終売品）と入力内容。"""
     sql = """
         SELECT i.*, c.name AS category_name, c.locations,
-               e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
-               e.case_weight AS entry_case_weight, e.expiry_kind, e.expiry_date, e.mfg_date,
+               e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.wh_pallets, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
+               e.case_weight AS entry_case_weight, e.pallet_cases AS entry_pallet_cases, e.expiry_kind, e.expiry_date, e.mfg_date,
                e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
                x.kg AS expected_kg
         FROM items i
@@ -164,6 +164,7 @@ class EntryIn(BaseModel):
     room_kg: float = Field(0, ge=0)
     wh_cases: float = Field(0, ge=0)
     wh_kg: float = Field(0, ge=0)
+    wh_pallets: float = Field(0, ge=0)
     # 端数の内訳（最大3つ）。あれば合計を room_kg / wh_kg にする
     room_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
     wh_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
@@ -201,16 +202,20 @@ def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
     else:
         status = logic.judge(expiry, ym, date.today())
     cw = item["case_weight"]
+    pc = item["pallet_cases"]
+    if body.wh_pallets and not pc:
+        raise HTTPException(400, "1パレットのケース数が未設定です。管理画面で設定してください")
     room_kg = round(sum(body.room_kg_parts), 3) if body.room_kg_parts is not None else body.room_kg
     wh_kg = round(sum(body.wh_kg_parts), 3) if body.wh_kg_parts is not None else body.wh_kg
-    total = logic.total_kg(cw, body.room_cases + body.wh_cases, room_kg + wh_kg)
+    cases = body.room_cases + body.wh_cases + body.wh_pallets * (pc or 0)
+    total = logic.total_kg(cw, cases, room_kg + wh_kg)
     keep_action = status in ("warn", "expired")
     return {
         "room_cases": body.room_cases, "room_kg": room_kg,
-        "wh_cases": body.wh_cases, "wh_kg": wh_kg,
+        "wh_cases": body.wh_cases, "wh_kg": wh_kg, "wh_pallets": body.wh_pallets,
         "room_kg_parts": json.dumps(body.room_kg_parts) if body.room_kg_parts is not None else None,
         "wh_kg_parts": json.dumps(body.wh_kg_parts) if body.wh_kg_parts is not None else None,
-        "case_weight": cw, "total_kg": total, "expiry_kind": body.expiry_kind,
+        "case_weight": cw, "pallet_cases": pc, "total_kg": total, "expiry_kind": body.expiry_kind,
         "expiry_date": expiry.isoformat() if expiry else None,
         "mfg_date": mfg.isoformat() if mfg else None, "status": status,
         "action": body.action if keep_action else "",
@@ -393,6 +398,7 @@ class ItemIn(BaseModel):
     category_id: int
     storage: str = "常温"
     case_weight: float | None = None
+    pallet_cases: float | None = Field(None, gt=0)
     expiry_mode: Literal["date", "mfg", "none"] = "date"
     mfg_months: int | None = None
     note: str = ""
@@ -401,6 +407,7 @@ class ItemIn(BaseModel):
 
 
 ITEM_LABEL = {"code": "コード", "name": "品名", "category_id": "分類", "storage": "保管", "case_weight": "ケース重量",
+              "pallet_cases": "1パレットのケース数",
               "expiry_mode": "期限の種類", "mfg_months": "製造日からの月数", "note": "メモ", "sort": "並び順",
               "active": "有効"}
 
