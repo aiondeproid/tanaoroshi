@@ -254,11 +254,79 @@ function closeSheet() {
 }
 sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
 
+// ---------- 大きいカレンダー ----------
+// 端末標準の日付ピッカーはタブレットだと小さいので、日付欄（readonly）をタップしたらこちらを出す
+const cal = document.createElement("div");
+cal.className = "cal";
+cal.hidden = true;
+document.body.append(cal);
+const isoDate = (y, m, d) => `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+
+function openCalendar(input) {
+  const picked = input.value;
+  const start = (picked || localToday()).split("-").map(Number);
+  let y = start[0], m = start[1];
+  const choose = (v) => {
+    input.value = v;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    cal.hidden = true;
+  };
+  const draw = () => {
+    const first = new Date(y, m - 1, 1).getDay();
+    const days = new Date(y, m, 0).getDate();
+    const today = localToday();
+    const cells = Array.from({ length: first }, () => `<span></span>`);
+    for (let d = 1; d <= days; d++) {
+      const v = isoDate(y, m, d);
+      const out = (input.min && v < input.min) || (input.max && v > input.max);
+      const wd = (first + d - 1) % 7;
+      cells.push(`<button type="button" data-v="${v}" ${out ? "disabled" : ""}
+        class="${v === picked ? "on" : ""} ${v === today ? "today" : ""} ${wd === 0 ? "sun" : wd === 6 ? "sat" : ""}">${d}</button>`);
+    }
+    cal.innerHTML = `<div class="cal-body">
+      <div class="cal-nav">
+        <button type="button" data-y="-1">«<small>前年</small></button>
+        <button type="button" data-m="-1">‹<small>前月</small></button>
+        <b>${y}年${m}月</b>
+        <button type="button" data-m="1">›<small>翌月</small></button>
+        <button type="button" data-y="1">»<small>翌年</small></button>
+      </div>
+      <div class="cal-grid">${"日月火水木金土".split("").map((w, i) => `<i class="${i === 0 ? "sun" : i === 6 ? "sat" : ""}">${w}</i>`).join("")}${cells.join("")}</div>
+      <div class="cal-foot">
+        <button class="btn" type="button" data-act="clear">消す</button>
+        <button class="btn" type="button" data-act="today">今日</button>
+        <span class="spacer"></span>
+        <button class="btn" type="button" data-act="close">閉じる</button>
+      </div></div>`;
+  };
+  cal.onclick = (e) => {
+    if (e.target === cal) { cal.hidden = true; return; }
+    const b = e.target.closest("button");
+    if (!b || b.disabled) return;
+    if (b.dataset.v) return choose(b.dataset.v);
+    if (b.dataset.y) y += Number(b.dataset.y);
+    if (b.dataset.m) { m += Number(b.dataset.m); if (m < 1) { m = 12; y--; } if (m > 12) { m = 1; y++; } }
+    if (b.dataset.act === "clear") return choose("");
+    if (b.dataset.act === "today") { const t = localToday(); if (!input.max || t <= input.max) return choose(t); }
+    if (b.dataset.act === "close") { cal.hidden = true; return; }
+    draw();
+  };
+  draw();
+  cal.hidden = false;
+}
+document.addEventListener("click", (e) => {
+  const input = e.target.closest?.("input[type=date][readonly]");
+  if (!input) return;
+  e.preventDefault();
+  openCalendar(input);
+});
+
 function actionFields(v) {
   return `<div class="box" id="action-box">
     <div class="label">期限切れ・1ヶ月未満の対応</div>
     <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${v.action === a ? "on" : ""}">${esc(a)}</button>`).join("")}</div>
-    <div class="field"><span>予定日</span><input type="date" id="action_date" value="${esc(v.action_date || "")}"></div>
+    <div class="field"><span>予定日</span><input type="date" readonly id="action_date" value="${esc(v.action_date || "")}"></div>
     <textarea id="action_note" placeholder="メモ（いつ使う、どこへ移動する など）">${esc(v.action_note || "")}</textarea>
   </div>`;
 }
@@ -276,17 +344,24 @@ function openEntry(it, cat, done) {
   const split = cat.locations === "split";
   const cw = it.entry_id ? it.entry_case_weight ?? it.case_weight : it.case_weight;
   const v = it.entry_id ? it : { room_cases: 0, room_kg: 0, wh_cases: 0, wh_kg: 0, expiry_kind: "賞" };
+  // 端数は3か所に分けて入れる。内訳がない古い入力は合計を1つ目に入れる
+  const KG_PARTS = 3;
+  const kgParts = (key) => {
+    const parts = v[key + "_kg_parts"] ? JSON.parse(v[key + "_kg_parts"]) : [v[key + "_kg"] || 0];
+    return Array.from({ length: KG_PARTS }, (_, i) => parts[i] || 0);
+  };
   const loc = (key, label) => `
     <div class="box"><div class="label">${label}</div>
       <div class="field"><span>ケース</span>
         <div class="stepper"><button type="button" data-step="${key}_cases" data-d="-1">−</button>
           <input id="${key}_cases" inputmode="decimal" value="${v[key + "_cases"] || 0}">
           <button type="button" data-step="${key}_cases" data-d="1">＋</button></div></div>
-      <div class="field"><span>端数</span><input class="num" id="${key}_kg" inputmode="decimal" value="${v[key + "_kg"] || ""}" placeholder="0"> kg</div>
+      <div class="field"><span>端数</span><div class="kg-parts">${kgParts(key).map((x, i) =>
+        `<input class="num" id="${key}_kg${i}" inputmode="decimal" value="${x || ""}" placeholder="0">`).join("")}</div> kg</div>
     </div>`;
   const expiryHtml = {
-    date: `<div class="field"><span>期限</span><input type="date" id="expiry_date" value="${esc(v.expiry_date || "")}"></div>`,
-    mfg: `<div class="field"><span>製造日</span><input type="date" id="mfg_date" value="${esc(v.mfg_date || "")}"></div>
+    date: `<div class="field"><span>期限</span><input type="date" readonly id="expiry_date" value="${esc(v.expiry_date || "")}"></div>`,
+    mfg: `<div class="field"><span>製造日</span><input type="date" readonly id="mfg_date" value="${esc(v.mfg_date || "")}"></div>
           <div class="muted">期限 = 製造日 ＋ ${it.mfg_months}ヶ月 → <b id="calc_expiry">-</b></div>`,
     none: `<div class="muted">この品目は期限の指定がありません</div>`,
   }[it.expiry_mode];
@@ -295,7 +370,7 @@ function openEntry(it, cat, done) {
     <div class="row"><h3>${esc(it.name)}</h3></div>
     <div class="muted">${esc(it.code)}・${esc(it.storage)}・ケース重量 ${cw ? cw + "kg" : "未設定"}</div>
     <div class="box"><div class="field"><span>棚卸日</span>
-        <input type="date" id="counted_on" value="${esc(it.counted_on || localToday())}" max="${localToday()}"></div>
+        <input type="date" readonly id="counted_on" value="${esc(it.counted_on || localToday())}" max="${localToday()}"></div>
       <div class="muted">${it.entry_id ? `最後の保存：${jdatetime(it.counted_at)}（${esc(it.counted_by)}）` : "今日の日付が入ります。別の日に数えた分はここで直してください"}</div></div>
     ${cw ? "" : `<div class="notice">ケース重量が未設定です。ケース数ではなく「端数」に重さ(kg)を入れてください。</div>`}
     ${split ? loc("room", "資材室") + loc("wh", "倉庫／パレット") : loc("room", "在庫")}
@@ -318,6 +393,8 @@ function openEntry(it, cat, done) {
     </div>`);
 
   const val = (id) => $("#" + id)?.value;
+  const partsOf = (key) => Array.from({ length: KG_PARTS }, (_, i) => num(val(`${key}_kg${i}`)));
+  const kgOf = (key) => round3(partsOf(key).reduce((a, b) => a + b, 0));
   const expectedValue = () => { const t = val("expected_kg").trim(); return t === "" ? null : num(t); };
   // 変わっていれば予想在庫を保存する
   const saveExpected = async () => {
@@ -329,7 +406,7 @@ function openEntry(it, cat, done) {
   };
   const recalc = () => {
     const cases = num(val("room_cases")) + (split ? num(val("wh_cases")) : 0);
-    const loose = num(val("room_kg")) + (split ? num(val("wh_kg")) : 0);
+    const loose = round3(kgOf("room") + (split ? kgOf("wh") : 0));
     const total = round3(cases * (cw || 0) + loose);
     $("#total").textContent = `${total}kg`;
     const exp = expectedValue();
@@ -363,8 +440,8 @@ function openEntry(it, cat, done) {
   });
   $("#save").addEventListener("click", async () => {
     const body = {
-      room_cases: num(val("room_cases")), room_kg: num(val("room_kg")),
-      wh_cases: split ? num(val("wh_cases")) : 0, wh_kg: split ? num(val("wh_kg")) : 0,
+      room_cases: num(val("room_cases")), room_kg: kgOf("room"), room_kg_parts: partsOf("room"),
+      wh_cases: split ? num(val("wh_cases")) : 0, wh_kg: split ? kgOf("wh") : 0, wh_kg_parts: split ? partsOf("wh") : null,
       expiry_kind: segValue($("#kind-seg")) || "賞",
       expiry_date: val("expiry_date") || null, mfg_date: val("mfg_date") || null,
       action: segValue($("#action-seg")), action_date: val("action_date") || null, action_note: val("action_note") || "",

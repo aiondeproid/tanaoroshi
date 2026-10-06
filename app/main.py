@@ -1,8 +1,9 @@
+import json
 import os
 import sqlite3
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
@@ -76,7 +77,7 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
     """その月に数える品目（有効な品目＋その月に入力済みの終売品）と入力内容。"""
     sql = """
         SELECT i.*, c.name AS category_name, c.locations,
-               e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.total_kg,
+               e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
                e.case_weight AS entry_case_weight, e.expiry_kind, e.expiry_date, e.mfg_date,
                e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
                x.kg AS expected_kg
@@ -163,6 +164,9 @@ class EntryIn(BaseModel):
     room_kg: float = Field(0, ge=0)
     wh_cases: float = Field(0, ge=0)
     wh_kg: float = Field(0, ge=0)
+    # 端数の内訳（最大3つ）。あれば合計を room_kg / wh_kg にする
+    room_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
+    wh_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
     expiry_kind: Literal["賞", "使", "凍"] = "賞"
     expiry_date: str | None = None
     mfg_date: str | None = None
@@ -197,11 +201,15 @@ def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
     else:
         status = logic.judge(expiry, ym, date.today())
     cw = item["case_weight"]
-    total = logic.total_kg(cw, body.room_cases + body.wh_cases, body.room_kg + body.wh_kg)
+    room_kg = round(sum(body.room_kg_parts), 3) if body.room_kg_parts is not None else body.room_kg
+    wh_kg = round(sum(body.wh_kg_parts), 3) if body.wh_kg_parts is not None else body.wh_kg
+    total = logic.total_kg(cw, body.room_cases + body.wh_cases, room_kg + wh_kg)
     keep_action = status in ("warn", "expired")
     return {
-        "room_cases": body.room_cases, "room_kg": body.room_kg,
-        "wh_cases": body.wh_cases, "wh_kg": body.wh_kg,
+        "room_cases": body.room_cases, "room_kg": room_kg,
+        "wh_cases": body.wh_cases, "wh_kg": wh_kg,
+        "room_kg_parts": json.dumps(body.room_kg_parts) if body.room_kg_parts is not None else None,
+        "wh_kg_parts": json.dumps(body.wh_kg_parts) if body.wh_kg_parts is not None else None,
         "case_weight": cw, "total_kg": total, "expiry_kind": body.expiry_kind,
         "expiry_date": expiry.isoformat() if expiry else None,
         "mfg_date": mfg.isoformat() if mfg else None, "status": status,

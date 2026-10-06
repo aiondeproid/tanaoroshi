@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS entries (
     room_kg REAL NOT NULL DEFAULT 0,  -- 端数
     wh_cases REAL NOT NULL DEFAULT 0,
     wh_kg REAL NOT NULL DEFAULT 0,
+    room_kg_parts TEXT,               -- 端数の内訳（JSON配列、合計が room_kg）
+    wh_kg_parts TEXT,                 -- 端数の内訳（JSON配列、合計が wh_kg）
     case_weight REAL,                 -- 入力時点のケース重量
     total_kg REAL NOT NULL DEFAULT 0,
     expiry_kind TEXT NOT NULL DEFAULT '賞',  -- 賞/使/凍
@@ -108,6 +110,10 @@ def init() -> None:
         if "counted_on" not in cols:
             con.execute("ALTER TABLE entries ADD COLUMN counted_on TEXT")
             con.execute("UPDATE entries SET counted_on = substr(counted_at, 1, 10)")
+        # 端数の内訳の列がない古いDBには足す（NULL=内訳なし、合計だけ）
+        for c in ("room_kg_parts", "wh_kg_parts"):
+            if c not in cols:
+                con.execute(f"ALTER TABLE entries ADD COLUMN {c} TEXT")
 
 
 def now() -> str:

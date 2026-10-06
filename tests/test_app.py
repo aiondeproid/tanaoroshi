@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 from datetime import date
@@ -80,6 +81,23 @@ def test_save_entry_computes_total_and_status(client):
     s = client.get("/api/months/2026-09/summary").json()["categories"][str(client.cat_id)]
     assert s["counted_from"] == s["counted_to"] == date.today().isoformat()
     assert e["action"] == ""  # 問題なければ対応は残さない
+
+
+def test_loose_kg_parts_are_summed_and_kept(client):
+    it = items(client)["04084"]
+    far = logic.add_months(date.today(), 3).isoformat()
+    r = client.put(f"/api/months/2026-09/items/{it['id']}", headers=USER,
+                   json={"room_cases": 2, "room_kg_parts": [1.5, 2, 1], "wh_cases": 1, "wh_kg_parts": [0.2, 0, 0],
+                         "expiry_kind": "賞", "expiry_date": far})
+    assert r.status_code == 200, r.text
+    e = r.json()
+    assert e["room_kg"] == 4.5 and e["wh_kg"] == 0.2
+    assert e["total_kg"] == 25.7
+    got = items(client)["04084"]
+    assert json.loads(got["room_kg_parts"]) == [1.5, 2, 1]
+    bad = client.put(f"/api/months/2026-09/items/{it['id']}", headers=USER,
+                     json={"room_kg_parts": [1, 1, 1, 1], "expiry_kind": "賞", "expiry_date": far})
+    assert bad.status_code == 422
 
 
 def test_expired_entry_shows_in_alerts_and_action(client):
