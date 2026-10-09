@@ -319,3 +319,33 @@ def test_items_excel_round_trip(client):
     assert not r["ok"] and len(r["errors"]) == 4
     master2 = {i["code"]: i for i in client.get("/api/admin/items", headers=ADMIN).json()}
     assert master2["01009"] == master["01009"]
+
+
+# ---------- バックアップ ----------
+
+def test_backup_copies_wal_and_prunes_old(tmp_path):
+    import sqlite3
+    from tools import backup
+
+    src = tmp_path / "src.db"
+    con = sqlite3.connect(src)
+    con.execute("PRAGMA journal_mode = WAL")
+    con.execute("CREATE TABLE t (v)")
+    con.execute("INSERT INTO t VALUES ('最新')")
+    con.commit()  # 接続を開いたままなので、この行は WAL に残っている
+
+    dest = tmp_path / "bk"
+    out = backup.backup(src, dest, date(2026, 10, 9))
+    con.close()
+    assert out.name == "tanaoroshi_20261009.db"
+    b = sqlite3.connect(out)
+    assert b.execute("SELECT v FROM t").fetchall() == [("最新",)]
+    b.close()
+    backup.backup(src, dest, date(2026, 10, 9))  # 同じ日は上書き
+
+    for name in ["tanaoroshi_20250908.db", "tanaoroshi_20250909.db", "tanaoroshi_20251010.db", "memo.db"]:
+        (dest / name).write_bytes(b"")
+    removed = backup.prune(dest, date(2026, 10, 9))
+    assert [p.name for p in removed] == ["tanaoroshi_20250908.db"]  # 13ヶ月前の 2025/9/9 より前だけ消す
+    assert sorted(p.name for p in dest.iterdir()) == [
+        "memo.db", "tanaoroshi_20250909.db", "tanaoroshi_20251010.db", "tanaoroshi_20261009.db"]

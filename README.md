@@ -46,8 +46,44 @@
 
 ## データ
 
-- すべてのデータは `data\tanaoroshi.db`（SQLite）の1ファイルに入る。バックアップはこのファイルをコピーするだけ
+- すべてのデータは `data\tanaoroshi.db`（SQLite）の1ファイルに入る
 - 変更履歴は、管理画面の「変更履歴」タブで確認できる
+
+### バックアップ
+
+動いている最中にエクスプローラーで `tanaoroshi.db` をコピーすると、最新の入力が抜けることがある。必ず `backup.bat` を使うこと。アプリを止めなくてよい。
+
+- 保存先は `tanaoroshi_20261009.db` のように日付つきで作る。同じ日に何度実行しても、その日の分を上書きするだけ
+- 13ヶ月より古いバックアップは自動で消す
+- 結果は `data\backup.log` に追記する
+
+設定のしかた:
+
+1. `backup_dir.txt` を作り、1行目に保存先のフォルダを書く。PCが壊れても残るように、共有フォルダを UNC パスで書く（ドライブ文字はタスクスケジューラから見えないことがある）。UNC パスは `net use` で調べられる
+
+   ```
+   \\サーバー名\共有名\棚卸\バックアップ
+   ```
+
+2. `backup.bat` をダブルクリックし、保存先にファイルができることを確かめる
+3. PowerShell で次を実行し、毎日12時に動くタスクを登録する。PCの電源が切れていて動けなかった日は、次に起動したときに実行する
+
+   ```
+   $bat = "$PWD\backup.bat"
+   Register-ScheduledTask -TaskName "棚卸バックアップ" `
+     -Action (New-ScheduledTaskAction -Execute $bat) `
+     -Trigger (New-ScheduledTaskTrigger -Daily -At 12:00) `
+     -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable)
+   ```
+
+   アプリのフォルダで実行すること。登録したタスクは、タスクスケジューラの「タスク スケジューラ ライブラリ」で確認できる
+
+元に戻すとき:
+
+1. アプリを止める
+2. `data\` の `tanaoroshi.db-wal` と `tanaoroshi.db-shm` を消す
+3. 戻したい日のバックアップを `data\tanaoroshi.db` という名前でコピーする
+4. アプリを起動する
 
 ## 開発
 
