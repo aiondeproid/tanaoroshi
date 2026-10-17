@@ -214,7 +214,7 @@ async function renderCategory(id) {
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
         <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? STATUS[it.status] : "未入力"}</span>
           ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
-          ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
+          ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
     $("#items").querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () =>
       openEntry(d.items.find((x) => x.id === Number(b.dataset.id)), d.category, () => renderCategory(id))));
@@ -400,6 +400,8 @@ function openEntry(it, cat, done) {
     <div class="box"><div class="label">予想在庫</div>
       <div class="field"><span>予想</span><input class="num" id="expected_kg" inputmode="decimal" value="${it.expected_kg ?? ""}" placeholder="未入力"> kg
         <button class="btn small" type="button" id="save-expected">予想だけ保存</button></div>
+      <div class="field"><span>時点</span><input type="date" readonly id="expected_as_of" value="${esc(it.expected_as_of || localToday())}"></div>
+      <div class="muted">${it.expected_kg != null ? `いつの時点の予想在庫かを入れてください（最後の保存：${jdate(it.expected_as_of)}時点）` : "いつの時点の予想在庫かを入れてください"}</div>
       <div class="muted" id="expected_diff"></div></div>
     <div class="box"><div class="label">賞味期限・使用期限</div>
       <div class="seg" id="kind-seg" data-required="1">${["賞", "使", "凍"].map((k) => `<button type="button" data-v="${k}" class="${v.expiry_kind === k ? "on" : ""}">${{ 賞: "賞味期限", 使: "使用期限(開封)", 凍: "冷凍の使用期限" }[k]}</button>`).join("")}</div>
@@ -420,9 +422,11 @@ function openEntry(it, cat, done) {
   // 変わっていれば予想在庫を保存する
   const saveExpected = async () => {
     const kg = expectedValue();
-    if (kg === (it.expected_kg ?? null)) return false;
-    await api("PUT", `/api/months/${state.ym}/items/${it.id}/expected`, { kg });
+    const as_of = val("expected_as_of") || localToday();
+    if (kg === (it.expected_kg ?? null) && (kg == null || as_of === it.expected_as_of)) return false;
+    const r = await api("PUT", `/api/months/${state.ym}/items/${it.id}/expected`, { kg, as_of });
     it.expected_kg = kg;
+    it.expected_as_of = r.as_of ?? null;
     return true;
   };
   const recalc = () => {
@@ -433,7 +437,7 @@ function openEntry(it, cat, done) {
     $("#total").textContent = `${total}kg`;
     const exp = expectedValue();
     const d = diffKg(total, exp);
-    $("#expected_diff").textContent = exp == null ? "入れると総重量との差を表示します" : `総重量 ${total}kg − 予想 ${exp}kg → ${fmtDiff(d)}`;
+    $("#expected_diff").textContent = exp == null ? "入れると総重量との差を表示します" : `総重量 ${total}kg − 予想 ${exp}kg（${jdate(val("expected_as_of") || localToday())}時点） → ${fmtDiff(d)}`;
     $("#expected_diff").className = d ? "diff-ng" : "muted";
     const pl = pallets ? `（うちパレット ${pallets}枚 × ${pc}ケース）` : "";
     $("#formula").textContent = cw ? `${cases}ケース${pl} × ${cw}kg ＋ 端数 ${loose}kg` : `端数の合計 ${loose}kg`;
@@ -762,19 +766,22 @@ async function adminExpected() {
     <ol class="steps">
       <li>ひな形をダウンロードする（その月の品目と、いま入っている予想在庫が並んでいます）
         <div><a class="btn" href="/api/months/${state.ym}/expected.xlsx" style="text-decoration:none;display:inline-flex;align-items:center;margin-top:6px">ひな形をダウンロード</a></div></li>
-      <li>「予想在庫(kg)」の列に数字を入れて保存する。空欄の行は変更しません</li>
-      <li>ファイルを選んで取り込む
+      <li>「予想在庫(kg)」の列に数字を、「時点」の列にいつの時点の数字かを入れて保存する。予想在庫が空欄の行は変更しません</li>
+      <li>時点が空欄の行に使う日を選び、ファイルを選んで取り込む
+        <div class="field" style="margin-top:6px"><span>時点</span><input type="date" readonly id="x_as_of" value="${localToday()}"></div>
         <div class="row" style="margin-top:6px"><input type="file" id="x_file" accept=".xlsx"><button class="btn primary" id="x_go">取り込む</button></div></li>
     </ol>
-    <p class="muted">「コード」と「予想在庫(kg)」の列があれば、ひな形以外の表でも取り込めます。エラーが1件でもあると何も取り込みません。</p>
+    <p class="muted">「コード」と「予想在庫(kg)」の列があれば、ひな形以外の表でも取り込めます（「時点」の列は無くても構いません）。エラーが1件でもあると何も取り込みません。</p>
     <div id="x_result"></div>`;
   $("#x_go").addEventListener("click", async () => {
     const f = $("#x_file").files[0];
     if (!f) return toast("ファイルを選んでください", true);
+    const asOf = $("#x_as_of").value;
+    if (!asOf) return toast("時点を選んでください", true);
     const out = $("#x_result");
     $("#x_go").disabled = true;
     try {
-      const r = await api("POST", `/api/admin/months/${state.ym}/expected/import`, await f.arrayBuffer(), true);
+      const r = await api("POST", `/api/admin/months/${state.ym}/expected/import?as_of=${asOf}`, await f.arrayBuffer(), true);
       out.innerHTML = r.ok
         ? `<div class="banner ok">${esc(f.name)}：${r.rows}件を読み込み、${r.changed}件を更新しました（${r.rows - r.changed}件は同じ値）</div>`
         : `<div class="notice"><b>取り込めませんでした（${r.errors.length}件のエラー）。直してからもう一度取り込んでください。</b>

@@ -80,7 +80,7 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.wh_pallets, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
                e.case_weight AS entry_case_weight, e.pallet_cases AS entry_pallet_cases, e.expiry_kind, e.expiry_date, e.mfg_date,
                e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
-               x.kg AS expected_kg
+               x.kg AS expected_kg, x.as_of AS expected_as_of
         FROM items i
         JOIN categories c ON c.id = i.category_id
         LEFT JOIN entries e ON e.item_id = i.id AND e.ym = ?
@@ -265,6 +265,16 @@ def delete_entry(ym: str, item_id: int, user: str = Depends(actor)):
 
 class ExpectedIn(BaseModel):
     kg: float | None = Field(None, ge=0)  # None=予想在庫を消す
+    as_of: str | None = None  # いつの時点の予想在庫か。None=今日
+
+
+def check_as_of(s: str | None) -> str:
+    if not s:
+        return date.today().isoformat()
+    try:
+        return date.fromisoformat(s).isoformat()
+    except ValueError:
+        raise HTTPException(400, "予想在庫の時点の形式が不正です")
 
 
 @app.put("/api/months/{ym}/items/{item_id}/expected")
@@ -279,13 +289,14 @@ def save_expected(ym: str, item_id: int, body: ExpectedIn, user: str = Depends(a
                 db.record(con, user, "expected", before["id"], "取消", f"{ym} {item['code']} {item['name']}", before, None)
             return {"kg": None}
         con.execute(
-            "INSERT INTO expected (ym, item_id, kg, set_by, set_at) VALUES (?,?,?,?,?)"
-            " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, set_by=excluded.set_by, set_at=excluded.set_at",
-            (ym, item_id, body.kg, user, db.now()),
+            "INSERT INTO expected (ym, item_id, kg, as_of, set_by, set_at) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, as_of=excluded.as_of,"
+            " set_by=excluded.set_by, set_at=excluded.set_at",
+            (ym, item_id, body.kg, check_as_of(body.as_of), user, db.now()),
         )
         after = db.row_dict(con.execute("SELECT * FROM expected WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
         db.record(con, user, "expected", after["id"], "更新" if before else "入力",
-                  f"{ym} {item['code']} {item['name']} 予想{after['kg']}kg", before, after)
+                  f"{ym} {item['code']} {item['name']} 予想{after['kg']}kg（{after['as_of']}時点）", before, after)
     return after
 
 
@@ -440,33 +451,37 @@ def clean_item(body: ItemIn) -> dict:
 
 
 @app.post("/api/admin/months/{ym}/expected/import")
-async def import_expected(ym: str, request: Request, user: str = Depends(admin)):
-    """予想在庫のExcelを取り込む。1件でもエラーがあれば何も書き込まない。"""
+async def import_expected(ym: str, request: Request, as_of: str | None = None, user: str = Depends(admin)):
+    """予想在庫のExcelを取り込む。1件でもエラーがあれば何も書き込まない。
+    時点が空欄の行は as_of（画面で選んだ日。無ければ今日）にする。"""
     ym = check_ym(ym)
+    default_as_of = check_as_of(as_of)
     data = await request.body()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(400, "ファイルが大きすぎます（10MBまで）")
     rows, errors = expected_xlsx.parse(data)
     with db.connect() as con:
         items = {r["code"]: dict(r) for r in con.execute("SELECT id, code, name FROM items")}
-        errors += [f"{line}行目：コード {code} は品目マスタにありません" for code, (line, _) in rows.items() if code not in items]
+        errors += [f"{line}行目：コード {code} は品目マスタにありません" for code, (line, _, _) in rows.items() if code not in items]
         if errors:
             return {"ok": False, "errors": errors}
         current = {r["item_id"]: dict(r) for r in con.execute("SELECT * FROM expected WHERE ym=?", (ym,))}
         changed = 0
-        for code, (_, kg) in rows.items():
+        for code, (_, kg, row_as_of) in rows.items():
             item = items[code]
             before = current.get(item["id"])
-            if before and before["kg"] == kg:
+            day = row_as_of or default_as_of
+            if before and before["kg"] == kg and before["as_of"] == day:
                 continue
             con.execute(
-                "INSERT INTO expected (ym, item_id, kg, set_by, set_at) VALUES (?,?,?,?,?)"
-                " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, set_by=excluded.set_by, set_at=excluded.set_at",
-                (ym, item["id"], kg, user, db.now()),
+                "INSERT INTO expected (ym, item_id, kg, as_of, set_by, set_at) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(ym, item_id) DO UPDATE SET kg=excluded.kg, as_of=excluded.as_of,"
+                " set_by=excluded.set_by, set_at=excluded.set_at",
+                (ym, item["id"], kg, day, user, db.now()),
             )
             after = db.row_dict(con.execute("SELECT * FROM expected WHERE ym=? AND item_id=?", (ym, item["id"])).fetchone())
             db.record(con, user, "expected", after["id"], "取込",
-                      f"{ym} {code} {item['name']} 予想{kg}kg", before, after)
+                      f"{ym} {code} {item['name']} 予想{kg}kg（{day}時点）", before, after)
             changed += 1
     return {"ok": True, "rows": len(rows), "changed": changed, "errors": []}
 

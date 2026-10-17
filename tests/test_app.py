@@ -2,7 +2,7 @@ import io
 import json
 import os
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 os.environ["TANAOROSHI_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
@@ -179,10 +179,13 @@ def test_expected_stock(client):
     url = f"/api/months/2026-10/items/{it['id']}/expected"
     assert it["expected_kg"] is None
     # 棚卸の入力前でも入れられる
-    assert client.put(url, headers=USER, json={"kg": 45.5}).json()["kg"] == 45.5
-    assert client.put(url, headers=USER, json={"kg": 40}).status_code == 200
+    r = client.put(url, headers=USER, json={"kg": 45.5}).json()
+    assert r["kg"] == 45.5 and r["as_of"] == date.today().isoformat()  # 時点を省くと今日
+    assert client.put(url, headers=USER, json={"kg": 40, "as_of": "2026-10-15"}).status_code == 200
     assert client.put(url, headers=USER, json={"kg": -1}).status_code == 422
-    assert items(client, "2026-10")["01009"]["expected_kg"] == 40
+    assert client.put(url, headers=USER, json={"kg": 40, "as_of": "10/15"}).status_code == 400
+    it = items(client, "2026-10")["01009"]
+    assert (it["expected_kg"], it["expected_as_of"]) == (40, "2026-10-15")
     assert items(client, "2026-11")["01009"]["expected_kg"] is None  # 月ごと
     hist = client.get("/api/admin/history?entity=expected", headers=ADMIN).json()
     assert [h["action"] for h in hist[:2]] == ["更新", "入力"]
@@ -203,17 +206,23 @@ def test_expected_import_from_template(client):
     url = "/api/admin/months/2026-12/expected/import"
     r = client.get("/api/months/2026-12/expected.xlsx")
     ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
-    assert [c.value for c in ws[3]] == ["コード", "品名", "分類", "保管", "予想在庫(kg)"]
+    assert [c.value for c in ws[3]] == ["コード", "品名", "分類", "保管", "予想在庫(kg)", "時点"]
     row = next(r for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=1).value == "04084")
     ws.cell(row=row, column=5).value = 12.5
+    ws.cell(row=row, column=6).value = datetime(2026, 11, 28)
     buf = io.BytesIO()
     ws.parent.save(buf)
     res = client.post(url, headers=ADMIN, content=buf.getvalue()).json()
     assert res == {"ok": True, "rows": 1, "changed": 1, "errors": []}
-    assert items(client, "2026-12")["04084"]["expected_kg"] == 12.5
+    it = items(client, "2026-12")["04084"]
+    assert (it["expected_kg"], it["expected_as_of"]) == (12.5, "2026-11-28")
     assert client.get("/api/admin/history?entity=expected", headers=ADMIN).json()[0]["action"] == "取込"
     # 同じ値なら更新しない
     assert client.post(url, headers=ADMIN, content=buf.getvalue()).json()["changed"] == 0
+    # 入っている時点がひな形に出る
+    r = client.get("/api/months/2026-12/expected.xlsx")
+    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
+    assert ws.cell(row=row, column=6).value == datetime(2026, 11, 28)
 
 
 def test_expected_import_rules(client):
@@ -223,6 +232,15 @@ def test_expected_import_rules(client):
     res = client.post(url, headers=ADMIN, content=xlsx([["メモ"], ["コード", "予想在庫"], [1009, "30kg"], ["04084", None]])).json()
     assert res["ok"] and res["rows"] == 1
     assert items(client, "2026-12")["01009"]["expected_kg"] == 30
+    assert items(client, "2026-12")["01009"]["expected_as_of"] == date.today().isoformat()
+    # 時点が空欄の行は画面で選んだ日。時点だけ変わっても更新する
+    res = client.post(url + "?as_of=2026-11-30", headers=ADMIN, content=xlsx([["コード", "予想在庫", "時点"], ["01009", 30, None], ["04084", 5, "2026/11/20"]])).json()
+    assert res["ok"] and res["changed"] == 2
+    got = items(client, "2026-12")
+    assert got["01009"]["expected_as_of"] == "2026-11-30" and got["04084"]["expected_as_of"] == "2026-11-20"
+    res = client.post(url, headers=ADMIN, content=xlsx([["コード", "予想在庫", "時点"], ["01009", 30, "そのうち"]])).json()
+    assert not res["ok"] and "時点" in res["errors"][0]
+    assert client.post(url + "?as_of=bad", headers=ADMIN, content=b"").status_code == 400
     # エラーが1件でもあれば何も書かない
     res = client.post(url, headers=ADMIN, content=xlsx([["コード", "予想在庫(kg)"], ["01009", 99], ["99999", 1], ["04084", "たくさん"]])).json()
     assert not res["ok"] and len(res["errors"]) == 2

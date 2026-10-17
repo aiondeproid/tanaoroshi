@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS expected (
     ym TEXT NOT NULL,                 -- 棚卸月 YYYY-MM
     item_id INTEGER NOT NULL REFERENCES items(id),
     kg REAL NOT NULL,                 -- 予想在庫（総重量と比べる）
+    as_of TEXT,                       -- 予想在庫がいつの時点の数字か YYYY-MM-DD
     set_by TEXT NOT NULL,
     set_at TEXT NOT NULL,
     UNIQUE (ym, item_id)
@@ -124,6 +125,10 @@ def init() -> None:
             con.execute("ALTER TABLE entries ADD COLUMN pallet_cases REAL")
         if "pallet_cases" not in {r["name"] for r in con.execute("PRAGMA table_info(items)")}:
             con.execute("ALTER TABLE items ADD COLUMN pallet_cases REAL")
+        # 予想在庫の時点の列がない古いDBには足して、入れた日で埋める
+        if "as_of" not in {r["name"] for r in con.execute("PRAGMA table_info(expected)")}:
+            con.execute("ALTER TABLE expected ADD COLUMN as_of TEXT")
+            con.execute("UPDATE expected SET as_of = substr(set_at, 1, 10)")
 
 
 def now() -> str:
