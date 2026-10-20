@@ -30,6 +30,13 @@ COLUMNS = [
 NULLABLE = {"case_weight", "pallet_cases", "mfg_months", "note"}
 
 
+def text(v) -> str:
+    """品名・メモ用。前後の空白だけ取り、文字そのものは変えない。"""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
 def category_label(c: dict) -> str:
     return f"{c['grp']} / {c['name']}"
 
@@ -112,7 +119,8 @@ def parse(data: bytes, categories: list[dict], storages: list[str]) -> tuple[lis
     if header is None:
         return [], ["見出しの行が見つかりません。「コード」と、変えたい列（「品名」「ケース重量(kg)」など）の見出しがある表にしてください"]
 
-    by_label = {category_label(c): c["id"] for c in categories}
+    # 読んだセルは norm（NFKC）するので、比べる側もそろえる。「粉体①」は「粉体1」になる
+    by_label = {norm(category_label(c)): c["id"] for c in categories}
     names: dict[str, list[int]] = {}
     for c in categories:
         names.setdefault(norm(c["name"]), []).append(c["id"])
@@ -147,7 +155,7 @@ def parse(data: bytes, categories: list[dict], storages: list[str]) -> tuple[lis
                 continue
             t = norm(v)
             if k == "name":
-                values[k] = t
+                values[k] = text(v)  # 自由に書く欄は「①」などを変えない
             elif k == "category":
                 cid = by_label.get(t) or (names[t][0] if len(names.get(t, [])) == 1 else None)
                 if cid is None:
@@ -170,7 +178,7 @@ def parse(data: bytes, categories: list[dict], storages: list[str]) -> tuple[lis
                 else:
                     values[k] = active_of[t]
             elif k == "note":
-                values[k] = t
+                values[k] = text(v)  # 自由に書く欄は「①」などを変えない
             else:  # 数字の列
                 label = dict((kk, h) for kk, h, _ in COLUMNS)[k]
                 try:

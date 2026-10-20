@@ -339,6 +339,21 @@ def test_items_excel_round_trip(client):
     assert master2["01009"] == master["01009"]
 
 
+
+def test_items_import_circled_digit_category(client):
+    """「粉体①」のような分類名・品名も、出力したExcelをそのまま戻せる。"""
+    cat = client.post("/api/admin/categories", json={"grp": "粉体資材", "name": "粉体①"}, headers=ADMIN).json()
+    url = "/api/admin/items/import"
+    data = xlsx([["コード", "品名", "分類"], ["03001", "粉①　特製", "粉体資材 / 粉体①"]])
+    r = client.post(url + "?apply=1", headers=ADMIN, content=data).json()
+    assert r["ok"], r["errors"]
+    master = {i["code"]: i for i in client.get("/api/admin/items", headers=ADMIN).json()}
+    assert master["03001"]["category_id"] == cat["id"] and master["03001"]["name"] == "粉①　特製"
+    # Excelで出力したものを戻しても変更なし
+    out = client.get("/api/admin/items.xlsx", headers=ADMIN).content
+    r = client.post(url, headers=ADMIN, content=out).json()
+    assert r["ok"] and r["changes"] == [], r
+
 # ---------- バックアップ ----------
 
 def test_backup_copies_wal_and_prunes_old(tmp_path):
