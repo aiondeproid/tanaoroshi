@@ -213,7 +213,7 @@ async function renderCategory(id) {
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
         <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? STATUS[it.status] : "未入力"}</span>
-          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
+          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : !it.total_kg ? "在庫ゼロ" : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
           ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
     $("#items").querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () =>
@@ -374,7 +374,8 @@ function openEntry(it, cat, done) {
     ? `<div class="field"><span>パレット</span>${stepper("wh_pallets")}<span class="muted">× ${pc}ケース</span></div>`
     : `<div class="muted">1パレットのケース数が未設定のため、パレットは入力できません（管理画面で設定）</div>`;
   const loc = (key, label) => `
-    <div class="box"><div class="label">${label}</div>
+    <div class="box"><div class="row"><span class="label">${label}</span><span class="spacer"></span>
+        <button class="btn small" type="button" data-zero="${key}">在庫ゼロ</button></div>
       ${pallet(key)}
       <div class="field"><span>ケース</span>${stepper(key + "_cases")}</div>
       <div class="field"><span>端数</span><div class="kg-parts">${kgParts(key).map((x, i) =>
@@ -444,16 +445,23 @@ function openEntry(it, cat, done) {
     let expiry = null;
     if (it.expiry_mode === "date") expiry = val("expiry_date") || null;
     if (it.expiry_mode === "mfg" && val("mfg_date")) { expiry = addMonths(val("mfg_date"), it.mfg_months); $("#calc_expiry").textContent = jdate(expiry); }
-    const st = it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym);
+    // 在庫ゼロなら期限は入れなくてよい（サーバーも判定しない）
+    const st = !total || it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym);
     const j = $("#judge");
     j.className = `judge s-${st}`;
-    j.textContent = st === "none" ? "期限を入れると判定します" : st === "ok" ? "レ（1ヶ月以上あり）" :
+    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? "レ（1ヶ月以上あり）" :
       st === "warn" ? `× 月末から1ヶ月未満（${jdate(okLimit(state.ym))} より前）` : "× 期限切れ";
     $("#action-box").hidden = !["warn", "expired"].includes(st);
   };
   sheet.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => {
     const inp = $("#" + b.dataset.step);
     inp.value = Math.max(0, num(inp.value) + Number(b.dataset.d));
+    recalc();
+  }));
+  sheet.querySelectorAll("[data-zero]").forEach((b) => b.addEventListener("click", () => {
+    const key = b.dataset.zero;
+    [`${key}_cases`, `${key}_pallets`].forEach((id) => { if ($("#" + id)) $("#" + id).value = 0; });
+    for (let i = 0; i < KG_PARTS; i++) $(`#${key}_kg${i}`).value = "";
     recalc();
   }));
   sheet.querySelectorAll("input").forEach((i) => i.addEventListener("input", recalc));

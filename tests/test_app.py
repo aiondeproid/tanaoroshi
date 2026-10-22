@@ -100,6 +100,17 @@ def test_loose_kg_parts_are_summed_and_kept(client):
     assert bad.status_code == 422
 
 
+def test_zero_stock_needs_no_expiry(client):
+    for code in ("04084", "01009"):  # 期限を入力 / 製造日から計算
+        it = items(client, "2026-06")[code]
+        assert client.put(f"/api/months/2026-06/items/{it['id']}", headers=USER,
+                          json={"room_cases": 1, "expiry_kind": "賞"}).status_code == 400
+        r = client.put(f"/api/months/2026-06/items/{it['id']}", headers=USER, json={"room_cases": 0, "expiry_kind": "賞"})
+        assert r.status_code == 200, r.text
+        e = r.json()
+        assert e["total_kg"] == 0 and e["status"] == "ok" and e["expiry_date"] is None
+
+
 def test_pallets_count_as_cases(client):
     it = items(client, "2026-07")["04084"]
     far = logic.add_months(date.today(), 3).isoformat()

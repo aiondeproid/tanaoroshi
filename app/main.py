@@ -197,10 +197,6 @@ def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
         expiry = logic.expiry_from_mfg(mfg, item["mfg_months"] or 0) if mfg else None
     else:
         expiry = parse_date(body.expiry_date)
-    if item["expiry_mode"] == "none":
-        status = "ok"
-    else:
-        status = logic.judge(expiry, ym, date.today())
     cw = item["case_weight"]
     pc = item["pallet_cases"]
     if body.wh_pallets and not pc:
@@ -209,6 +205,17 @@ def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
     wh_kg = round(sum(body.wh_kg_parts), 3) if body.wh_kg_parts is not None else body.wh_kg
     cases = body.room_cases + body.wh_cases + body.wh_pallets * (pc or 0)
     total = logic.total_kg(cw, cases, room_kg + wh_kg)
+    # 在庫ゼロなら期限は入れなくてよく、判定もしない
+    if not total:
+        status = "ok"
+    elif item["expiry_mode"] == "date" and not expiry:
+        raise HTTPException(400, "期限の日付を入れてください")
+    elif item["expiry_mode"] == "mfg" and not mfg:
+        raise HTTPException(400, "製造日を入れてください")
+    elif item["expiry_mode"] == "none":
+        status = "ok"
+    else:
+        status = logic.judge(expiry, ym, date.today())
     keep_action = status in ("warn", "expired")
     return {
         "room_cases": body.room_cases, "room_kg": room_kg,
@@ -229,10 +236,6 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
     ym = check_ym(ym)
     with db.connect() as con:
         item = get_item(con, item_id)
-        if item["expiry_mode"] == "date" and not body.expiry_date:
-            raise HTTPException(400, "期限の日付を入れてください")
-        if item["expiry_mode"] == "mfg" and not body.mfg_date:
-            raise HTTPException(400, "製造日を入れてください")
         new = build_entry(item, ym, body)
         before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
         new.update(counted_by=user, counted_at=db.now(), counted_on=check_counted_on(body.counted_on, before))

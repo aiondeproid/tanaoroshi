@@ -130,7 +130,8 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
             entered = it["entry_id"] is not None
             loc = ([it["room_cases"], it["room_kg"], it["wh_pallets"], it["wh_cases"], it["wh_kg"]] if split
                    else [it["room_cases"], it["room_kg"]]) if entered else [None] * len(loc_sub)
-            expiry = jdate(it["expiry_date"]) or (MODE_NOTE.get(it["expiry_mode"], "") if entered else "")
+            expiry = jdate(it["expiry_date"]) or (("在庫ゼロ" if not it["total_kg"] else MODE_NOTE.get(it["expiry_mode"], ""))
+                                                  if entered else "")
             if it["mfg_date"]:
                 expiry += f"\n(製造日{jdate(it['mfg_date'])})"
             name = it["name"] + ("（終売）" if not it["active"] else "")
