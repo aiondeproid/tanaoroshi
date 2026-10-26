@@ -388,10 +388,13 @@ def export_xlsx(ym: str):
 
 
 @app.get("/api/months/{ym}/expected.xlsx")
-def expected_template(ym: str):
+def expected_template(ym: str, order: str = "sort"):
     ym = check_ym(ym)
     with db.connect() as con:
-        data = expected_xlsx.build_template(ym, month_items(con, ym))
+        rows = month_items(con, ym)
+    if order == "code":
+        rows.sort(key=lambda it: it["code"])
+    data = expected_xlsx.build_template(ym, rows)
     name = f"予想在庫_{ym}.xlsx"
     return Response(
         data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

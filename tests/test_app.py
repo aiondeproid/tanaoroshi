@@ -236,6 +236,13 @@ def test_expected_import_from_template(client):
     assert ws.cell(row=row, column=6).value == datetime(2026, 11, 28)
 
 
+def test_expected_template_code_order(client):
+    r = client.get("/api/months/2026-12/expected.xlsx?order=code")
+    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
+    codes = [ws.cell(row=r, column=1).value for r in range(4, ws.max_row + 1)]
+    assert codes and codes == sorted(codes)
+
+
 def test_expected_import_rules(client):
     url = "/api/admin/months/2026-12/expected/import"
     assert client.post(url, headers=USER, content=b"").status_code == 403

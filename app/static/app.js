@@ -773,7 +773,10 @@ async function adminExpected() {
     <p>${y}年${m}月の予想在庫をExcelでまとめて入れます（月は画面上の年月で切り替え）。</p>
     <ol class="steps">
       <li>ひな形をダウンロードする（その月の品目と、いま入っている予想在庫が並んでいます）
-        <div><a class="btn" href="/api/months/${state.ym}/expected.xlsx" style="text-decoration:none;display:inline-flex;align-items:center;margin-top:6px">ひな形をダウンロード</a></div></li>
+        <div class="row" style="margin-top:6px">
+          <a class="btn" href="/api/months/${state.ym}/expected.xlsx" style="text-decoration:none;display:inline-flex;align-items:center">ひな形をダウンロード（いまの並び順）</a>
+          <a class="btn" href="/api/months/${state.ym}/expected.xlsx?order=code" style="text-decoration:none;display:inline-flex;align-items:center">ひな形をダウンロード（コード順）</a>
+        </div></li>
       <li>「予想在庫(kg)」の列に数字を、「時点」の列にいつの時点の数字かを入れて保存する。予想在庫が空欄の行は変更しません</li>
       <li>時点が空欄の行に使う日を選び、ファイルを選んで取り込む
         <div class="field" style="margin-top:6px"><span>時点</span><input type="date" readonly id="x_as_of" value="${localToday()}"></div>
