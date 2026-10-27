@@ -400,3 +400,75 @@ def test_backup_copies_wal_and_prunes_old(tmp_path):
     assert [p.name for p in removed] == ["tanaoroshi_20250908.db"]  # 13ヶ月前の 2025/9/9 より前だけ消す
     assert sorted(p.name for p in dest.iterdir()) == [
         "memo.db", "tanaoroshi_20250909.db", "tanaoroshi_20251010.db", "tanaoroshi_20261009.db"]
+
+
+def test_item_docs(client):
+    it = items(client)["01009"]
+    url = f"/api/admin/items/{it['id']}/docs?name=" + "%E8%A6%8F%E6%A0%BC%E6%9B%B8.pdf"  # 規格書.pdf
+    pdf = b"%PDF-1.4\n%test\n"
+    assert client.post(url, headers=USER, content=pdf).status_code == 403
+    assert client.post(url, headers=ADMIN, content=b"not a pdf").status_code == 400
+    doc = client.post(url, headers=ADMIN, content=pdf).json()
+    assert doc["name"] == "規格書.pdf" and doc["size"] == len(pdf)
+    # 誰でも一覧を見て開ける。入力画面の品目にも件数が出る
+    assert [d["id"] for d in client.get(f"/api/items/{it['id']}/docs").json()] == [doc["id"]]
+    r = client.get(f"/api/docs/{doc['id']}")
+    assert r.content == pdf and r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"].startswith("inline")
+    assert items(client)["01009"]["doc_count"] == 1
+    assert client.get("/api/admin/history?entity=doc", headers=ADMIN).json()[0]["action"] == "追加"
+    # 削除するとファイルも消える
+    assert client.delete(f"/api/admin/docs/{doc['id']}", headers=ADMIN).json()["ok"]
+    assert client.get(f"/api/docs/{doc['id']}").status_code == 404
+    assert items(client)["01009"]["doc_count"] == 0
+
+
+def test_backup_docs_copies_only_new(tmp_path):
+    from tools import backup
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "1.pdf").write_bytes(b"%PDF-1")
+    dest = tmp_path / "bk"
+    assert backup.backup_docs(src, dest) == 1
+    (src / "2.pdf").write_bytes(b"%PDF-2")
+    assert backup.backup_docs(src, dest) == 1
+    assert sorted(p.name for p in (dest / "docs").iterdir()) == ["1.pdf", "2.pdf"]
+    assert backup.backup_docs(tmp_path / "none", dest) == 0
+
+
+def minimal_pdf(pages: int) -> bytes:
+    """白紙のPDFを作る（xref の位置も正しく書く）。"""
+    kids = " ".join(f"{3 + i} 0 R" for i in range(pages))
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>", f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>"]
+    objs += ["<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>"] * pages
+    out, offsets = b"%PDF-1.4\n", []
+    for n, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj\n{o}\nendobj\n".encode()
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += "".join(f"{x:010d} 00000 n \n" for x in offsets).encode()
+    return out + f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+
+
+def test_png_writer():
+    import zlib
+    from app import pdf_pages
+    data = pdf_pages.png(2, 1, 3, 8, bytes([255, 0, 0, 0, 255, 0, 9, 9]))  # stride の余り(9,9)は捨てる
+    assert data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR"
+    idat = data.index(b"IDAT")
+    size = int.from_bytes(data[idat - 4:idat], "big")
+    assert zlib.decompress(data[idat + 4:idat + 4 + size]) == bytes([0, 255, 0, 0, 0, 255, 0])
+
+
+def test_doc_page_images(client):
+    pytest.importorskip("pypdfium2")
+    it = items(client)["04084"]
+    doc = client.post(f"/api/admin/items/{it['id']}/docs?name=a.pdf", headers=ADMIN, content=minimal_pdf(2)).json()
+    assert client.get(f"/api/items/{it['id']}/docs").json()[0]["pages"] == 2
+    thumb = client.get(f"/api/docs/{doc['id']}/pages/1.png")
+    large = client.get(f"/api/docs/{doc['id']}/pages/2.png?size=large")
+    assert thumb.headers["content-type"] == "image/png" and int.from_bytes(thumb.content[16:20], "big") == 240
+    assert int.from_bytes(large.content[16:20], "big") == 1200
+    assert client.get(f"/api/docs/{doc['id']}/pages/3.png").status_code == 404
+    client.delete(f"/api/admin/docs/{doc['id']}", headers=ADMIN)

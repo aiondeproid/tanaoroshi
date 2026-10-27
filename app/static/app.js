@@ -72,6 +72,53 @@ async function api(method, path, body, raw = false) {
   return res.json();
 }
 
+// 品目の資料（PDF）。リンクは新しいタブでブラウザのPDFビューアを開く
+const fmtSize = (n) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))}KB` : `${Math.round(n / 1024 / 102.4) / 10}MB`);
+const docLinks = (docs, removable = false) => docs.length ? docs.map((d) => `<div class="row doc">
+    <a href="/api/docs/${d.id}" target="_blank" rel="noopener">${esc(d.name)}</a><span class="muted">${fmtSize(d.size)}</span>
+    ${removable ? `<span class="spacer"></span><button class="btn small danger" type="button" data-deldoc="${d.id}">削除</button>` : ""}</div>`).join("")
+  : `<div class="muted">資料はありません</div>`;
+
+// 入力画面ではサムネイルを並べ、タップで大きく見る。画像にできないPDF（pages が null）はファイル名だけ出して、タップでPDFを開く
+const docThumbs = (docs) => `<div class="doc-thumbs">${docs.map((d) => `<button type="button" class="doc-thumb" data-doc="${d.id}">
+    ${d.pages ? `<img src="/api/docs/${d.id}/pages/1.png" alt="" loading="lazy">` : `<span class="doc-noimg">PDF</span>`}
+    <span class="doc-name">${esc(d.name)}${d.pages > 1 ? `（${d.pages}ページ）` : ""}</span></button>`).join("")}</div>`;
+function bindDocThumbs(el, docs) {
+  el.querySelectorAll("[data-doc]").forEach((b) => b.addEventListener("click", () => {
+    const d = docs.find((x) => x.id === Number(b.dataset.doc));
+    if (d.pages) openViewer(d); else window.open(`/api/docs/${d.id}`, "_blank", "noopener");
+  }));
+}
+
+// 資料があれば欄を出し、開いたあとに loadDocsBox でサムネイルを入れる
+const docsBox = (it) => (it.doc_count ? `<div class="box"><div class="label">資料</div><div id="docs" class="muted">読み込み中…</div></div>` : "");
+function loadDocsBox(it) {
+  if (!it.doc_count) return;
+  api("GET", `/api/items/${it.id}/docs`).then((docs) => {
+    const box = $("#docs");
+    box.className = "";
+    box.innerHTML = docThumbs(docs);
+    bindDocThumbs(box, docs);
+  }).catch((e) => { $("#docs").textContent = e.message; });
+}
+
+// 資料を全ページ大きく表示する。入力シートの上に重ねるので、閉じてもシートはそのまま
+const viewer = document.createElement("div");
+viewer.className = "viewer";
+viewer.hidden = true;
+document.body.appendChild(viewer);
+function openViewer(d) {
+  viewer.innerHTML = `<div class="viewer-bar"><span class="doc-name">${esc(d.name)}</span><span class="spacer"></span>
+      <a class="btn small" href="/api/docs/${d.id}" target="_blank" rel="noopener">PDFで開く</a>
+      <button class="btn small" type="button" id="viewer-close">閉じる</button></div>
+    <div class="viewer-pages">${Array.from({ length: d.pages }, (_, i) =>
+      `<img src="/api/docs/${d.id}/pages/${i + 1}.png?size=large" alt="${i + 1}ページ" loading="lazy">`).join("")}</div>`;
+  viewer.hidden = false;
+  $("#viewer-close").addEventListener("click", closeViewer);
+}
+function closeViewer() { viewer.hidden = true; viewer.innerHTML = ""; }
+viewer.addEventListener("click", (e) => { if (e.target === viewer || e.target.classList.contains("viewer-pages")) closeViewer(); });
+
 // ---------- 期限判定（app/logic.py と同じ計算） ----------
 const lastDay = (y, m) => new Date(y, m, 0).getDate(); // m は 1-12
 function addMonths(iso, months) {
@@ -409,6 +456,7 @@ function openEntry(it, cat, done) {
       ${expiryHtml}
       <div class="judge s-none" id="judge"></div>
     </div>
+    ${docsBox(it)}
     ${actionFields(v)}
     <div class="actions-bar">
       <button class="btn" type="button" id="close">閉じる</button>
@@ -467,6 +515,7 @@ function openEntry(it, cat, done) {
   sheet.querySelectorAll("input").forEach((i) => i.addEventListener("input", recalc));
   bindSeg($("#kind-seg"));
   bindSeg($("#action-seg"));
+  loadDocsBox(it);
   $("#close").addEventListener("click", closeSheet);
   $("#del")?.addEventListener("click", async () => {
     if (!confirm("この品目の入力を取り消しますか？")) return;
@@ -505,7 +554,7 @@ async function renderAlerts() {
       return `<button class="item" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
           <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span>
-          <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span></span>
+          <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.doc_count ? `・資料 ${it.doc_count}件` : ""}</span></span>
         <span class="side"><span class="pill s-${it.status}">${STATUS[it.status]}</span><br>
           ${it.action ? `<b>${esc(it.action)}</b>${it.action_date ? "<br>" + jdate(it.action_date) : ""}` : `<span style="color:var(--ng)">対応未記入</span>`}</span>
       </button>`;
@@ -514,9 +563,11 @@ async function renderAlerts() {
     const it = d.items.find((x) => x.id === Number(b.dataset.id));
     openSheet(`<h3>${esc(it.name)}</h3>
       <div class="muted">${esc(it.code)}・${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}</div>
+      ${docsBox(it)}
       ${actionFields(it)}
       <div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="save">保存</button></div>`);
     bindSeg($("#action-seg"));
+    loadDocsBox(it);
     $("#close").addEventListener("click", closeSheet);
     $("#save").addEventListener("click", async () => {
       try {
@@ -531,7 +582,7 @@ async function renderAlerts() {
 
 // ---------- 管理画面 ----------
 const EXPIRY_MODE = { date: "期限を入力", mfg: "製造日から計算", none: "期限指定無し" };
-const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認" };
+const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認", doc: "資料" };
 const adminView = { q: "", cat: "", inactive: false, hq: "", hentity: "" };
 
 async function renderAdmin(tab) {
@@ -597,7 +648,7 @@ async function adminItems() {
     <div class="row" style="margin-top:8px"><button class="btn" id="xout">Excelで出力</button>
       <button class="btn" id="xin">Excelで一括変更</button></div>
     <p class="muted" id="acount"></p>
-    <div class="table-wrap"><table><thead><tr><th>コード</th><th>品名</th><th>分類</th><th>保管</th><th>ケース重量</th><th>パレット</th><th>期限</th><th>状態</th></tr></thead><tbody id="arows"></tbody></table></div>`;
+    <div class="table-wrap"><table><thead><tr><th>コード</th><th>品名</th><th>分類</th><th>保管</th><th>ケース重量</th><th>パレット</th><th>期限</th><th>資料</th><th>状態</th></tr></thead><tbody id="arows"></tbody></table></div>`;
   const draw = () => {
     const q = adminView.q.trim().toLowerCase();
     const rows = items.filter((i) => (adminView.inactive || i.active) && (!adminView.cat || String(i.category_id) === adminView.cat)
@@ -606,7 +657,8 @@ async function adminItems() {
     $("#arows").innerHTML = rows.map((i) => `<tr class="click" data-id="${i.id}"><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category_name)}</td>
       <td>${esc(i.storage)}</td><td>${i.case_weight == null ? `<span style="color:var(--ng)">未設定</span>` : i.case_weight + "kg"}</td>
       <td>${i.pallet_cases == null ? `<span class="muted">-</span>` : i.pallet_cases + "ケース"}</td>
-      <td>${esc(EXPIRY_MODE[i.expiry_mode])}${i.expiry_mode === "mfg" ? `+${i.mfg_months}ヶ月` : ""}</td><td>${i.active ? "有効" : `<span style="color:var(--ng)">終売</span>`}</td></tr>`).join("");
+      <td>${esc(EXPIRY_MODE[i.expiry_mode])}${i.expiry_mode === "mfg" ? `+${i.mfg_months}ヶ月` : ""}</td>
+      <td>${i.doc_count ? i.doc_count + "件" : `<span class="muted">-</span>`}</td><td>${i.active ? "有効" : `<span style="color:var(--ng)">終売</span>`}</td></tr>`).join("");
     el.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => itemForm(items.find((x) => x.id === Number(tr.dataset.id)), cats)));
   };
   $("#aq").addEventListener("input", (e) => { adminView.q = e.target.value; draw(); });
@@ -683,11 +735,47 @@ function itemForm(it, cats) {
       <label>並び順（小さいほど上）<input class="text" id="f_sort" inputmode="numeric" value="${v.sort}"></label>
       <label>状態<select id="f_active"><option value="1" ${v.active ? "selected" : ""}>有効</option><option value="0" ${v.active ? "" : "selected"}>終売（棚卸に出さない）</option></select></label>
     </div>
+    <div class="box"><div class="label">資料（PDF）</div>
+      ${it ? `<div id="f_docs" class="muted">読み込み中…</div>
+        <div class="row" style="margin-top:8px"><input type="file" id="f_doc_file" accept="application/pdf,.pdf" multiple><button class="btn" type="button" id="f_doc_add">追加</button></div>
+        <div class="muted">追加・削除はすぐ反映されます（「保存」は要りません）。1ファイル20MBまで</div>`
+      : `<div class="muted">品目を保存してから追加できます</div>`}</div>
     <div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="save">保存</button></div>`);
   const syncMode = () => ($("#f_months_wrap").hidden = $("#f_mode").value !== "mfg");
   $("#f_mode").addEventListener("change", syncMode);
   syncMode();
-  $("#close").addEventListener("click", closeSheet);
+  let docsChanged = false; // 一覧の資料の数を直すため、閉じるときに読み直す
+  const loadDocs = async () => {
+    const box = $("#f_docs");
+    try { box.outerHTML = `<div id="f_docs">${docLinks(await api("GET", `/api/items/${it.id}/docs`), true)}</div>`; }
+    catch (e) { box.textContent = e.message; return; }
+    $("#f_docs").querySelectorAll("[data-deldoc]").forEach((b) => b.addEventListener("click", async () => {
+      if (!confirm("この資料を削除しますか？")) return;
+      try { await api("DELETE", `/api/admin/docs/${b.dataset.deldoc}`); docsChanged = true; toast("削除しました"); loadDocs(); }
+      catch (e) { toast(e.message, true); }
+    }));
+  };
+  if (it) {
+    loadDocs();
+    $("#f_doc_add").addEventListener("click", async () => {
+      const files = [...$("#f_doc_file").files];
+      if (!files.length) return toast("PDFファイルを選んでください", true);
+      const btn = $("#f_doc_add");
+      btn.disabled = true;
+      try {
+        for (const f of files) {
+          if (f.size > 20 * 1024 * 1024) throw new Error(`${f.name} は20MBを超えています`);
+          await api("POST", `/api/admin/items/${it.id}/docs?name=${encodeURIComponent(f.name)}`, await f.arrayBuffer(), true);
+          docsChanged = true;
+        }
+        toast(`${files.length}件追加しました`);
+        $("#f_doc_file").value = "";
+      } catch (e) { toast(e.message, true); }
+      btn.disabled = false;
+      loadDocs();
+    });
+  }
+  $("#close").addEventListener("click", () => { closeSheet(); if (docsChanged) adminItems(); });
   $("#save").addEventListener("click", async () => {
     const cw = $("#f_cw").value.trim();
     const pcv = $("#f_pc").value.trim();

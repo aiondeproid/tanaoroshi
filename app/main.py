@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import db, expected_xlsx, export, items_xlsx, logic
+from . import db, expected_xlsx, export, items_xlsx, logic, pdf_pages
 
 ADMIN_PIN = os.environ.get("TANAOROSHI_ADMIN_PIN", "1234")
 STATIC = Path(__file__).resolve().parent / "static"
@@ -80,7 +80,8 @@ def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.wh_pallets, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
                e.case_weight AS entry_case_weight, e.pallet_cases AS entry_pallet_cases, e.expiry_kind, e.expiry_date, e.mfg_date,
                e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
-               x.kg AS expected_kg, x.as_of AS expected_as_of
+               x.kg AS expected_kg, x.as_of AS expected_as_of,
+               (SELECT COUNT(*) FROM item_docs d WHERE d.item_id = i.id) AS doc_count
         FROM items i
         JOIN categories c ON c.id = i.category_id
         LEFT JOIN entries e ON e.item_id = i.id AND e.ym = ?
@@ -402,6 +403,67 @@ def expected_template(ym: str, order: str = "sort"):
     )
 
 
+# ---------- 品目の資料（PDF） ----------
+
+DOC_MAX = 20 * 1024 * 1024
+
+
+def get_doc(con, doc_id: int) -> dict:
+    doc = db.row_dict(con.execute("SELECT * FROM item_docs WHERE id=?", (doc_id,)).fetchone())
+    if not doc:
+        raise HTTPException(404, "資料がありません")
+    return doc
+
+
+def doc_pages(doc_id: int) -> int | None:
+    """ページ数。画像にできない（pypdfium2 が無い・壊れたPDF）ときは None で、画面はファイル名だけ出す。"""
+    if not pdf_pages.available():
+        return None
+    try:
+        return pdf_pages.page_count(db.doc_path(doc_id))
+    except Exception:
+        return None
+
+
+@app.get("/api/items/{item_id}/docs")
+def item_docs(item_id: int):
+    with db.connect() as con:
+        get_item(con, item_id)
+        docs = [dict(r) for r in con.execute("SELECT * FROM item_docs WHERE item_id=? ORDER BY id", (item_id,))]
+    for d in docs:
+        d["pages"] = doc_pages(d["id"])
+    return docs
+
+
+@app.get("/api/docs/{doc_id}/pages/{page_no}.png")
+def doc_page_image(doc_id: int, page_no: int, size: Literal["thumb", "large"] = "thumb"):
+    with db.connect() as con:
+        get_doc(con, doc_id)
+    pages = doc_pages(doc_id)
+    if not pages or not 1 <= page_no <= pages:
+        raise HTTPException(404, "ページがありません")
+    # 資料は追加後に変わらないので、一度作った画像は取っておく
+    cache = db.DOCS_DIR / "img" / f"{doc_id}_{page_no}_{size}.png"
+    if not cache.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_bytes(pdf_pages.render(db.doc_path(doc_id), page_no, pdf_pages.WIDTHS[size]))
+        tmp.replace(cache)
+    return FileResponse(cache, media_type="image/png")
+
+
+@app.get("/api/docs/{doc_id}")
+def open_doc(doc_id: int):
+    with db.connect() as con:
+        doc = get_doc(con, doc_id)
+    path = db.doc_path(doc_id)
+    if not path.exists():
+        raise HTTPException(404, "資料のファイルが見つかりません")
+    # inline にしてブラウザのPDFビューアで開く
+    return FileResponse(path, media_type="application/pdf",
+                        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(doc['name'])}"})
+
+
 # ---------- 管理者 ----------
 
 @app.post("/api/admin/login")
@@ -496,7 +558,9 @@ async def import_expected(ym: str, request: Request, as_of: str | None = None, u
 def admin_items(_: str = Depends(admin)):
     with db.connect() as con:
         return [dict(r) for r in con.execute(
-            "SELECT i.*, c.name AS category_name FROM items i JOIN categories c ON c.id=i.category_id"
+            "SELECT i.*, c.name AS category_name,"
+            " (SELECT COUNT(*) FROM item_docs d WHERE d.item_id=i.id) AS doc_count"
+            " FROM items i JOIN categories c ON c.id=i.category_id"
             " ORDER BY c.sort, i.sort, i.code")]
 
 
@@ -526,6 +590,39 @@ def update_item(item_id: int, body: ItemIn, user: str = Depends(admin)):
             action = "終売" if before["active"] and not after["active"] else "変更"
             db.record(con, user, "item", item_id, action, f"{after['code']} {after['name']}：{change}", before, after)
     return after
+
+
+@app.post("/api/admin/items/{item_id}/docs")
+async def add_doc(item_id: int, request: Request, name: str, user: str = Depends(admin)):
+    """PDFを1つ追加する。本文はファイルそのもの、ファイル名は name で受ける。"""
+    data = await request.body()
+    if len(data) > DOC_MAX:
+        raise HTTPException(400, "ファイルが大きすぎます（20MBまで）")
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(400, "PDFファイルを選んでください")
+    name = Path(name.replace("\\", "/")).name.strip() or "資料.pdf"
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        cur = con.execute("INSERT INTO item_docs (item_id, name, size, added_by, added_at) VALUES (?,?,?,?,?)",
+                          (item_id, name, len(data), user, db.now()))
+        after = get_doc(con, cur.lastrowid)
+        db.DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        db.doc_path(after["id"]).write_bytes(data)
+        db.record(con, user, "doc", after["id"], "追加", f"{item['code']} {item['name']}：{name}", None, after)
+    return after
+
+
+@app.delete("/api/admin/docs/{doc_id}")
+def delete_doc(doc_id: int, user: str = Depends(admin)):
+    with db.connect() as con:
+        before = get_doc(con, doc_id)
+        item = get_item(con, before["item_id"])
+        con.execute("DELETE FROM item_docs WHERE id=?", (doc_id,))
+        db.record(con, user, "doc", doc_id, "削除", f"{item['code']} {item['name']}：{before['name']}", before, None)
+    db.doc_path(doc_id).unlink(missing_ok=True)
+    for img in (db.DOCS_DIR / "img").glob(f"{doc_id}_*.png"):
+        img.unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @app.get("/api/admin/items.xlsx")

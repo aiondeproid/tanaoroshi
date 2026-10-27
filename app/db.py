@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("TANAOROSHI_DB", Path(__file__).resolve().parent.parent / "data" / "tanaoroshi.db"))
+DOCS_DIR = DB_PATH.parent / "docs"  # 品目の資料（PDF）。ファイル名は item_docs.id
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
@@ -81,6 +82,14 @@ CREATE TABLE IF NOT EXISTS approvals (
     at TEXT NOT NULL,
     UNIQUE (ym, category_id, role)
 );
+CREATE TABLE IF NOT EXISTS item_docs (
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    name TEXT NOT NULL,               -- 元のファイル名
+    size INTEGER NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY,
     at TEXT NOT NULL,
@@ -94,6 +103,7 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE INDEX IF NOT EXISTS idx_history_at ON history(at);
 CREATE INDEX IF NOT EXISTS idx_entries_ym ON entries(ym);
+CREATE INDEX IF NOT EXISTS idx_item_docs_item ON item_docs(item_id);
 """
 
 
@@ -129,6 +139,10 @@ def init() -> None:
         if "as_of" not in {r["name"] for r in con.execute("PRAGMA table_info(expected)")}:
             con.execute("ALTER TABLE expected ADD COLUMN as_of TEXT")
             con.execute("UPDATE expected SET as_of = substr(set_at, 1, 10)")
+
+
+def doc_path(doc_id: int) -> Path:
+    return DOCS_DIR / f"{doc_id}.pdf"
 
 
 def now() -> str:

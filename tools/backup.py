@@ -3,9 +3,11 @@
 使い方:  .venv\\Scripts\\python tools\\backup.py [保存先フォルダ]
 保存先を省略すると backup_dir.txt の1行目を読む。PCの外（共有フォルダ）を UNC パスで指定すること。
 アプリを動かしたままでも安全にコピーできる。同じ日に2回実行すると、その日の分を上書きする。
+品目の資料（PDF）は保存先の docs フォルダに、まだ無いものだけコピーする（アプリで消した資料もバックアップには残る）。
 タスクスケジューラからは backup.bat を実行する。
 """
 import re
+import shutil
 import sqlite3
 import sys
 from datetime import date, datetime
@@ -41,6 +43,20 @@ def backup(src: Path, dest_dir: Path, today: date) -> Path:
         raise RuntimeError(f"バックアップの検査で異常がありました: {result}")
     tmp.replace(out)
     return out
+
+
+def backup_docs(src_dir: Path, dest_dir: Path) -> int:
+    """資料のPDFは追加後に変わらないので、保存先に無いものだけコピーする。"""
+    if not src_dir.exists():
+        return 0
+    out = dest_dir / "docs"
+    out.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for p in src_dir.glob("*.pdf"):
+        if not (out / p.name).exists():
+            shutil.copy2(p, out / p.name)
+            copied += 1
+    return copied
 
 
 def prune(dest_dir: Path, today: date) -> list[Path]:
@@ -82,8 +98,9 @@ def main() -> None:
         sys.exit(f"{db.DB_PATH} がありません")
     today = date.today()
     out = backup(db.DB_PATH, dest, today)
+    docs = backup_docs(db.DOCS_DIR, dest)
     removed = prune(dest, today)
-    print(f"{datetime.now():%Y-%m-%d %H:%M} バックアップしました: {out}（古いバックアップを {len(removed)} 件削除）")
+    print(f"{datetime.now():%Y-%m-%d %H:%M} バックアップしました: {out}（資料 {docs} 件を追加、古いバックアップを {len(removed)} 件削除）")
 
 
 if __name__ == "__main__":
