@@ -25,7 +25,7 @@ def month_end(ym: str) -> date:
 
 
 def ok_limit(ym: str, months: int = WARN_MONTHS) -> date:
-    """この日以降の期限なら「レ」。"""
+    """この日を過ぎた期限なら「レ」。この日までは「×」（ちょうど○ヶ月は以内とみなす）。"""
     return add_months(month_end(ym), months)
 
 
@@ -34,12 +34,12 @@ def expiry_from_mfg(mfg: date, months: int) -> date:
 
 
 def judge(expiry: date | None, ym: str, ref: date, months: int = WARN_MONTHS) -> str:
-    """ok=months以上あり / warn=months未満 / expired=ref時点で期限切れ / none=期限未入力"""
+    """ok=monthsを超えてあり / warn=months以内 / expired=ref時点で期限切れ / none=期限未入力"""
     if expiry is None:
         return "none"
     if expiry < ref:
         return "expired"
-    if expiry < ok_limit(ym, months):
+    if expiry <= ok_limit(ym, months):
         return "warn"
     return "ok"
 

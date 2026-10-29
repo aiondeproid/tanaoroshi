@@ -29,8 +29,8 @@ def test_add_months_keeps_month_end():
 
 
 @pytest.mark.parametrize("expiry, expected", [
-    (date(2026, 10, 31), "ok"),       # 月末(9/30)からちょうど1ヶ月
-    (date(2026, 10, 30), "warn"),     # 1ヶ月に1日足りない
+    (date(2026, 11, 1), "ok"),        # 月末(9/30)から1ヶ月を超えている
+    (date(2026, 10, 31), "warn"),     # ちょうど1ヶ月は以内なので×
     (date(2026, 9, 26), "warn"),
     (date(2026, 9, 24), "expired"),
     (None, "none"),
@@ -41,8 +41,8 @@ def test_judge(expiry, expected):
 
 def test_judge_months():
     assert logic.ok_limit("2026-10", 2) == date(2026, 12, 31)
-    assert logic.judge(date(2026, 12, 30), "2026-10", date(2026, 10, 29), 2) == "warn"
-    assert logic.judge(date(2026, 12, 31), "2026-10", date(2026, 10, 29), 2) == "ok"
+    assert logic.judge(date(2026, 12, 31), "2026-10", date(2026, 10, 29), 2) == "warn"
+    assert logic.judge(date(2027, 1, 1), "2026-10", date(2026, 10, 29), 2) == "ok"
 
 
 def test_total_kg():
@@ -486,7 +486,7 @@ def test_category_warn_months_rejudges_this_month(client):
     it = client.post("/api/admin/items", headers=ADMIN, json={"code": "M001", "name": "豚肉", "category_id": cat["id"],
                                                               "case_weight": 10}).json()
     ym = date.today().strftime("%Y-%m")
-    expiry = logic.add_months(logic.month_end(ym), 1).isoformat()  # 1ヶ月ならレ、2ヶ月なら×
+    expiry = logic.add_months(logic.month_end(ym), 2).isoformat()  # 1ヶ月ならレ、2ヶ月なら×
     url = f"/api/months/{ym}/items/{it['id']}"
     client.put(url, headers=USER, json={"room_cases": 1, "expiry_date": expiry})
     old = client.put(f"/api/months/2020-01/items/{it['id']}", headers=USER,

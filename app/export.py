@@ -15,7 +15,7 @@ WARN_FILL = PatternFill("solid", fgColor="FFF2CC")
 EXPIRED_FILL = PatternFill("solid", fgColor="F8CBAD")
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 WRAP = Alignment(vertical="center", wrap_text=True)
-STATUS_TEXT = {"ok": "レ", "warn": "×（{}ヶ月未満）", "expired": "×（期限切れ）", "none": ""}
+STATUS_TEXT = {"ok": "レ", "warn": "×（{}ヶ月以内）", "expired": "×（期限切れ）", "none": ""}
 MODE_NOTE = {"none": "期限指定無し"}
 
 
@@ -50,7 +50,7 @@ def status_text(it) -> str:
 def rule_text(ym: str, months: int) -> str:
     me, limit = logic.month_end(ym), logic.ok_limit(ym, months)
     return (f"賞味期限管理：確認月の月末（{me.month}/{me.day}）から{months}ヶ月"
-            f"（{limit.year}/{limit.month}/{limit.day}）以上あるか確認　・{months}ヶ月以上あり：レ　・未満：×")
+            f"（{limit.year}/{limit.month}/{limit.day}）を超えてあるか確認　・超えてあり：レ　・{limit.month}/{limit.day}まで：×")
 
 
 def cell(ws, r, c, v, **style):

@@ -30,9 +30,9 @@ const round3 = (v) => Math.round(v * 1000) / 1000;
 // 実在庫 − 予想在庫。どちらかが無ければ null
 const diffKg = (total, expected) => (total == null || expected == null ? null : round3(total - expected));
 const fmtDiff = (d) => (d == null ? "" : d === 0 ? "差 0kg" : `差 ${d > 0 ? "+" : "−"}${Math.abs(d)}kg`);
-const STATUS = { none: "未入力", ok: "レ", warn: "× 1ヶ月未満", expired: "× 期限切れ" };
+const STATUS = { none: "未入力", ok: "レ", warn: "× 1ヶ月以内", expired: "× 期限切れ" };
 // warn の月数は分類ごとに違う
-const statusLabel = (it) => it.status === "warn" ? `× ${it.warn_months}ヶ月未満` : STATUS[it.status];
+const statusLabel = (it) => it.status === "warn" ? `× ${it.warn_months}ヶ月以内` : STATUS[it.status];
 
 function toast(msg, err = false) {
   const t = $("#toast");
@@ -135,7 +135,7 @@ function okLimit(ym, months) { return addMonths(monthEnd(ym), months); }
 function judge(expiry, ym, months) {
   if (!expiry) return "none";
   if (expiry < state.meta.today) return "expired";
-  if (expiry < okLimit(ym, months)) return "warn";
+  if (expiry <= okLimit(ym, months)) return "warn";
   return "ok";
 }
 function daysLeft(iso) {
@@ -238,7 +238,7 @@ function ruleLines(cats) {
   cats.forEach((c) => (byMonths[c.warn_months] ||= []).push(c.name));
   const keys = Object.keys(byMonths).map(Number).sort((a, b) => a - b);
   const base = keys.reduce((a, b) => (byMonths[b].length > byMonths[a].length ? b : a), keys[0]);
-  return keys.map((k) => `<p class="muted">判定基準：期限が ${jdate(okLimit(state.ym, k))} 以降なら「レ」（月末 ${jdate(monthEnd(state.ym))} から${k}ヶ月）${
+  return keys.map((k) => `<p class="muted">判定基準：期限が ${jdate(okLimit(state.ym, k))} より後なら「レ」、それまでは「×」（月末 ${jdate(monthEnd(state.ym))} から${k}ヶ月以内は×）${
     keys.length > 1 && k !== base ? `…${byMonths[k].map(esc).join("・")}` : ""}</p>`).join("");
 }
 
@@ -283,7 +283,7 @@ async function renderCategory(id) {
   view.innerHTML = `
     <a class="back" href="#/">← 戻る</a>
     <h1>${esc(d.category.name)}</h1>
-    <p class="muted">判定基準：期限が ${jdate(d.ok_limit)} 以降なら「レ」（月末 ${jdate(d.month_end)} から${d.category.warn_months}ヶ月）</p>
+    <p class="muted">判定基準：期限が ${jdate(d.ok_limit)} より後なら「レ」、それまでは「×」（月末 ${jdate(d.month_end)} から${d.category.warn_months}ヶ月以内は×）</p>
     <input class="search" id="q" type="search" placeholder="コード・品名で探す" value="${esc(catView.q)}">
     <div class="chips">
       <button class="chip" data-f="all">すべて (${d.items.length})</button>
@@ -399,7 +399,7 @@ document.addEventListener("click", (e) => {
 
 function actionFields(v) {
   return `<div class="box" id="action-box">
-    <div class="label">期限切れ・${v.warn_months}ヶ月未満の対応</div>
+    <div class="label">期限切れ・${v.warn_months}ヶ月以内の対応</div>
     <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${v.action === a ? "on" : ""}">${esc(a)}</button>`).join("")}</div>
     <div class="field"><span>予定日</span><input type="date" readonly id="action_date" value="${esc(v.action_date || "")}"></div>
     <textarea id="action_note" placeholder="メモ（いつ使う、どこへ移動する など）">${esc(v.action_note || "")}</textarea>
@@ -510,8 +510,8 @@ function openEntry(it, cat, done) {
     const st = !total || it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym, cat.warn_months);
     const j = $("#judge");
     j.className = `judge s-${st}`;
-    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月以上あり）` :
-      st === "warn" ? `× 月末から${cat.warn_months}ヶ月未満（${jdate(okLimit(state.ym, cat.warn_months))} より前）` : "× 期限切れ";
+    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月を超えてあり）` :
+      st === "warn" ? `× 月末から${cat.warn_months}ヶ月以内（${jdate(okLimit(state.ym, cat.warn_months))} まで）` : "× 期限切れ";
     $("#action-box").hidden = !["warn", "expired"].includes(st);
   };
   sheet.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => {
