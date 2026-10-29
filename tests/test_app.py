@@ -39,6 +39,12 @@ def test_judge(expiry, expected):
     assert logic.judge(expiry, "2026-09", date(2026, 9, 25)) == expected
 
 
+def test_judge_months():
+    assert logic.ok_limit("2026-10", 2) == date(2026, 12, 31)
+    assert logic.judge(date(2026, 12, 30), "2026-10", date(2026, 10, 29), 2) == "warn"
+    assert logic.judge(date(2026, 12, 31), "2026-10", date(2026, 10, 29), 2) == "ok"
+
+
 def test_total_kg():
     assert logic.total_kg(10, 3, 4.5) == 34.5
     assert logic.total_kg(None, 3, 4.5) == 4.5
@@ -472,3 +478,28 @@ def test_doc_page_images(client):
     assert int.from_bytes(large.content[16:20], "big") == 1200
     assert client.get(f"/api/docs/{doc['id']}/pages/3.png").status_code == 404
     client.delete(f"/api/admin/docs/{doc['id']}", headers=ADMIN)
+
+
+def test_category_warn_months_rejudges_this_month(client):
+    cat = client.post("/api/admin/categories", json={"grp": "原料肉", "name": "原料肉"}, headers=ADMIN).json()
+    assert cat["warn_months"] == 1
+    it = client.post("/api/admin/items", headers=ADMIN, json={"code": "M001", "name": "豚肉", "category_id": cat["id"],
+                                                              "case_weight": 10}).json()
+    ym = date.today().strftime("%Y-%m")
+    expiry = logic.add_months(logic.month_end(ym), 1).isoformat()  # 1ヶ月ならレ、2ヶ月なら×
+    url = f"/api/months/{ym}/items/{it['id']}"
+    client.put(url, headers=USER, json={"room_cases": 1, "expiry_date": expiry})
+    old = client.put(f"/api/months/2020-01/items/{it['id']}", headers=USER,
+                     json={"room_cases": 1, "expiry_date": "2020-02-29"}).json()
+
+    body = {"grp": "原料肉", "name": "原料肉", "warn_months": 2}
+    assert client.put(f"/api/admin/categories/{cat['id']}", headers=ADMIN, json={**body, "warn_months": 0}).status_code == 422
+    assert client.put(f"/api/admin/categories/{cat['id']}", headers=ADMIN, json=body).json()["warn_months"] == 2
+    d = client.get(f"/api/months/{ym}/categories/{cat['id']}").json()
+    assert d["ok_limit"] == logic.ok_limit(ym, 2).isoformat()
+    assert d["items"][0]["status"] == "warn" and d["items"][0]["warn_months"] == 2
+    # 過去の月は判定し直さない
+    assert client.get(f"/api/months/2020-01/categories/{cat['id']}").json()["items"][0]["status"] == old["status"]
+    assert "再判定" in [h["action"] for h in client.get("/api/admin/history?entity=entry", headers=ADMIN).json()]
+    # 新しく保存するときも分類の月数で判定する
+    assert client.put(url, headers=USER, json={"room_cases": 2, "expiry_date": expiry}).json()["status"] == "warn"

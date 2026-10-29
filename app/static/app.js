@@ -31,6 +31,8 @@ const round3 = (v) => Math.round(v * 1000) / 1000;
 const diffKg = (total, expected) => (total == null || expected == null ? null : round3(total - expected));
 const fmtDiff = (d) => (d == null ? "" : d === 0 ? "差 0kg" : `差 ${d > 0 ? "+" : "−"}${Math.abs(d)}kg`);
 const STATUS = { none: "未入力", ok: "レ", warn: "× 1ヶ月未満", expired: "× 期限切れ" };
+// warn の月数は分類ごとに違う
+const statusLabel = (it) => it.status === "warn" ? `× ${it.warn_months}ヶ月未満` : STATUS[it.status];
 
 function toast(msg, err = false) {
   const t = $("#toast");
@@ -129,11 +131,11 @@ function addMonths(iso, months) {
   return `${ny}-${String(nm).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 function monthEnd(ym) { const [y, m] = ym.split("-").map(Number); return `${ym}-${String(lastDay(y, m)).padStart(2, "0")}`; }
-function okLimit(ym) { return addMonths(monthEnd(ym), state.meta.warn_months); }
-function judge(expiry, ym) {
+function okLimit(ym, months) { return addMonths(monthEnd(ym), months); }
+function judge(expiry, ym, months) {
   if (!expiry) return "none";
   if (expiry < state.meta.today) return "expired";
-  if (expiry < okLimit(ym)) return "warn";
+  if (expiry < okLimit(ym, months)) return "warn";
   return "ok";
 }
 function daysLeft(iso) {
@@ -216,7 +218,7 @@ async function renderHome() {
   const [y, m] = state.ym.split("-").map(Number);
   view.innerHTML = `
     <h1>${y}年${m}月の棚卸</h1>
-    <p class="muted">判定基準：期限が ${jdate(s.ok_limit)} 以降なら「レ」（月末 ${jdate(s.month_end)} から${state.meta.warn_months}ヶ月）</p>
+    ${ruleLines(cats)}
     ${warn + expired
       ? `<a class="banner warn" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）→ 一覧と対応</a>`
       : `<a class="banner ok" href="#/alerts">期限警告はありません</a>`}
@@ -228,6 +230,16 @@ async function renderHome() {
       <a class="btn primary" href="/api/months/${state.ym}/export.xlsx" style="text-decoration:none;display:inline-flex;align-items:center">Excelで出力</a>
       <a class="btn" href="#/admin" style="text-decoration:none;display:inline-flex;align-items:center">管理画面</a>
     </div>`;
+}
+
+// 判定基準。分類で月数が違うときは月数ごとに1行
+function ruleLines(cats) {
+  const byMonths = {};
+  cats.forEach((c) => (byMonths[c.warn_months] ||= []).push(c.name));
+  const keys = Object.keys(byMonths).map(Number).sort((a, b) => a - b);
+  const base = keys.reduce((a, b) => (byMonths[b].length > byMonths[a].length ? b : a), keys[0]);
+  return keys.map((k) => `<p class="muted">判定基準：期限が ${jdate(okLimit(state.ym, k))} 以降なら「レ」（月末 ${jdate(monthEnd(state.ym))} から${k}ヶ月）${
+    keys.length > 1 && k !== base ? `…${byMonths[k].map(esc).join("・")}` : ""}</p>`).join("");
 }
 
 function catCard(c, s) {
@@ -259,7 +271,7 @@ async function renderCategory(id) {
     $("#items").innerHTML = items.length ? items.map((it) => `
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
-        <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? STATUS[it.status] : "未入力"}</span>
+        <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? statusLabel(it) : "未入力"}</span>
           ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : !it.total_kg ? "在庫ゼロ" : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
           ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
@@ -271,6 +283,7 @@ async function renderCategory(id) {
   view.innerHTML = `
     <a class="back" href="#/">← 戻る</a>
     <h1>${esc(d.category.name)}</h1>
+    <p class="muted">判定基準：期限が ${jdate(d.ok_limit)} 以降なら「レ」（月末 ${jdate(d.month_end)} から${d.category.warn_months}ヶ月）</p>
     <input class="search" id="q" type="search" placeholder="コード・品名で探す" value="${esc(catView.q)}">
     <div class="chips">
       <button class="chip" data-f="all">すべて (${d.items.length})</button>
@@ -386,7 +399,7 @@ document.addEventListener("click", (e) => {
 
 function actionFields(v) {
   return `<div class="box" id="action-box">
-    <div class="label">期限切れ・1ヶ月未満の対応</div>
+    <div class="label">期限切れ・${v.warn_months}ヶ月未満の対応</div>
     <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${v.action === a ? "on" : ""}">${esc(a)}</button>`).join("")}</div>
     <div class="field"><span>予定日</span><input type="date" readonly id="action_date" value="${esc(v.action_date || "")}"></div>
     <textarea id="action_note" placeholder="メモ（いつ使う、どこへ移動する など）">${esc(v.action_note || "")}</textarea>
@@ -457,7 +470,7 @@ function openEntry(it, cat, done) {
       <div class="judge s-none" id="judge"></div>
     </div>
     ${docsBox(it)}
-    ${actionFields(v)}
+    ${actionFields({ ...v, warn_months: cat.warn_months })}
     <div class="actions-bar">
       <button class="btn" type="button" id="close">閉じる</button>
       ${it.entry_id ? `<button class="btn danger" type="button" id="del">入力取消</button>` : ""}
@@ -494,11 +507,11 @@ function openEntry(it, cat, done) {
     if (it.expiry_mode === "date") expiry = val("expiry_date") || null;
     if (it.expiry_mode === "mfg" && val("mfg_date")) { expiry = addMonths(val("mfg_date"), it.mfg_months); $("#calc_expiry").textContent = jdate(expiry); }
     // 在庫ゼロなら期限は入れなくてよい（サーバーも判定しない）
-    const st = !total || it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym);
+    const st = !total || it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym, cat.warn_months);
     const j = $("#judge");
     j.className = `judge s-${st}`;
-    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? "レ（1ヶ月以上あり）" :
-      st === "warn" ? `× 月末から1ヶ月未満（${jdate(okLimit(state.ym))} より前）` : "× 期限切れ";
+    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月以上あり）` :
+      st === "warn" ? `× 月末から${cat.warn_months}ヶ月未満（${jdate(okLimit(state.ym, cat.warn_months))} より前）` : "× 期限切れ";
     $("#action-box").hidden = !["warn", "expired"].includes(st);
   };
   sheet.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => {
@@ -555,7 +568,7 @@ async function renderAlerts() {
         <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
           <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span>
           <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.doc_count ? `・資料 ${it.doc_count}件` : ""}</span></span>
-        <span class="side"><span class="pill s-${it.status}">${STATUS[it.status]}</span><br>
+        <span class="side"><span class="pill s-${it.status}">${statusLabel(it)}</span><br>
           ${it.action ? `<b>${esc(it.action)}</b>${it.action_date ? "<br>" + jdate(it.action_date) : ""}` : `<span style="color:var(--ng)">対応未記入</span>`}</span>
       </button>`;
     }).join("") : `<p class="muted" style="padding:14px">警告はありません</p>`}</div>`;
@@ -798,22 +811,24 @@ async function adminCategories() {
   const cats = await api("GET", "/api/admin/categories");
   const el = $("#admin");
   el.innerHTML = `<div class="row"><span class="spacer"></span><button class="btn primary" id="add">＋ 分類を追加</button></div>
-    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>並び順</th><th>グループ</th><th>分類名</th><th>置き場所</th><th>状態</th></tr></thead>
+    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>並び順</th><th>グループ</th><th>分類名</th><th>置き場所</th><th>判定</th><th>状態</th></tr></thead>
     <tbody>${cats.map((c) => `<tr class="click" data-id="${c.id}"><td>${c.sort}</td><td>${esc(c.grp)}</td><td>${esc(c.name)}</td>
-      <td>${c.locations === "split" ? "資材室＋倉庫" : "1か所"}</td><td>${c.active ? "有効" : "使わない"}</td></tr>`).join("")}</tbody></table></div>`;
+      <td>${c.locations === "split" ? "資材室＋倉庫" : "1か所"}</td><td>月末から${c.warn_months}ヶ月</td><td>${c.active ? "有効" : "使わない"}</td></tr>`).join("")}</tbody></table></div>`;
   const form = (c) => {
-    const v = c || { grp: "", name: "", locations: "split", sort: (cats.at(-1)?.sort || 0) + 10, active: 1 };
+    const v = c || { grp: "", name: "", locations: "split", warn_months: state.meta.warn_months, sort: (cats.at(-1)?.sort || 0) + 10, active: 1 };
     openSheet(`<h3>${c ? "分類を変更" : "分類を追加"}</h3><div class="form-grid" style="margin-top:12px">
       <label>グループ（トップ画面の見出し）<input class="text" id="c_grp" value="${esc(v.grp)}"></label>
       <label>分類名<input class="text" id="c_name" value="${esc(v.name)}"></label>
       <label>置き場所<select id="c_loc"><option value="split" ${v.locations === "split" ? "selected" : ""}>資材室と倉庫/パレットに分ける</option><option value="single" ${v.locations === "single" ? "selected" : ""}>1か所</option></select></label>
+      <label>判定の月数（月末から何ヶ月あれば「レ」か）<input class="text" id="c_months" inputmode="numeric" value="${v.warn_months}"></label>
       <label>並び順<input class="text" id="c_sort" inputmode="numeric" value="${v.sort}"></label>
       <label>状態<select id="c_active"><option value="1" ${v.active ? "selected" : ""}>有効</option><option value="0" ${v.active ? "" : "selected"}>使わない</option></select></label>
       </div><div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="save">保存</button></div>`);
     $("#close").addEventListener("click", closeSheet);
     $("#save").addEventListener("click", async () => {
-      const body = { grp: $("#c_grp").value.trim(), name: $("#c_name").value.trim(), locations: $("#c_loc").value, sort: Number($("#c_sort").value) || 0, active: $("#c_active").value === "1" };
+      const body = { grp: $("#c_grp").value.trim(), name: $("#c_name").value.trim(), locations: $("#c_loc").value, warn_months: Number($("#c_months").value), sort: Number($("#c_sort").value) || 0, active: $("#c_active").value === "1" };
       if (!body.grp || !body.name) return toast("グループと分類名を入れてください", true);
+      if (!Number.isInteger(body.warn_months) || body.warn_months < 1 || body.warn_months > 24) return toast("判定の月数は1〜24で入れてください", true);
       try {
         await api(c ? "PUT" : "POST", c ? `/api/admin/categories/${c.id}` : "/api/admin/categories", body);
         closeSheet(); toast("保存しました"); state.meta = await api("GET", "/api/meta"); adminCategories();

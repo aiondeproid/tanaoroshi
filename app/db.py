@@ -1,8 +1,10 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+
+from . import logic
 
 DB_PATH = Path(os.environ.get("TANAOROSHI_DB", Path(__file__).resolve().parent.parent / "data" / "tanaoroshi.db"))
 DOCS_DIR = DB_PATH.parent / "docs"  # 品目の資料（PDF）。ファイル名は item_docs.id
@@ -13,6 +15,7 @@ CREATE TABLE IF NOT EXISTS categories (
     grp TEXT NOT NULL,              -- 元のファイル単位のまとまり（タレ液体、粉体資材 など）
     name TEXT NOT NULL,
     locations TEXT NOT NULL DEFAULT 'split',  -- split=資材室と倉庫/パレット / single=1か所
+    warn_months INTEGER NOT NULL DEFAULT 1,   -- 確認月の月末から何ヶ月あれば「レ」か
     sort INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1
 );
@@ -139,6 +142,37 @@ def init() -> None:
         if "as_of" not in {r["name"] for r in con.execute("PRAGMA table_info(expected)")}:
             con.execute("ALTER TABLE expected ADD COLUMN as_of TEXT")
             con.execute("UPDATE expected SET as_of = substr(set_at, 1, 10)")
+        # 判定の月数の列がない古いDBには足す。原料肉と野菜・チーズ・玉ねぎは2ヶ月
+        if "warn_months" not in {r["name"] for r in con.execute("PRAGMA table_info(categories)")}:
+            con.execute("ALTER TABLE categories ADD COLUMN warn_months INTEGER NOT NULL DEFAULT 1")
+            for r in con.execute("SELECT * FROM categories WHERE grp IN ('原料肉', '野菜チーズ玉ねぎ')").fetchall():
+                con.execute("UPDATE categories SET warn_months=2 WHERE id=?", (r["id"],))
+                record(con, "システム", "category", r["id"], "変更", f"{r['name']}：判定の月数: 1 → 2")
+                rejudge(con, r["id"], 2, "システム")
+
+
+def rejudge(con, category_id: int, months: int, actor: str) -> None:
+    """判定の月数を変えたとき、今月以降の入力を新しい月数で判定し直す。
+    期限切れかどうかは保存した日を基準にする（保存時と同じ）。"""
+    ym_from = datetime.now().strftime("%Y-%m")
+    rows = con.execute(
+        "SELECT e.*, i.code, i.name FROM entries e JOIN items i ON i.id = e.item_id"
+        " WHERE i.category_id=? AND e.ym>=? AND e.total_kg>0 AND e.expiry_date IS NOT NULL",
+        (category_id, ym_from)).fetchall()
+    for r in rows:
+        status = logic.judge(date.fromisoformat(r["expiry_date"]), r["ym"],
+                             date.fromisoformat(r["counted_at"][:10]), months)
+        if status == r["status"]:
+            continue
+        before = {k: r[k] for k in r.keys() if k not in ("code", "name")}
+        if status in ("warn", "expired"):
+            con.execute("UPDATE entries SET status=? WHERE id=?", (status, r["id"]))
+        else:
+            con.execute("UPDATE entries SET status=?, action='', action_date=NULL, action_note='' WHERE id=?",
+                        (status, r["id"]))
+        after = row_dict(con.execute("SELECT * FROM entries WHERE id=?", (r["id"],)).fetchone())
+        record(con, actor, "entry", r["id"], "再判定",
+               f"{r['ym']} {r['code']} {r['name']} 判定{r['status']}→{status}（{months}ヶ月）", before, after)
 
 
 def doc_path(doc_id: int) -> Path:

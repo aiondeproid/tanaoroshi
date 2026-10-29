@@ -2,7 +2,7 @@
 import calendar
 from datetime import date
 
-# 確認月の月末から何ヶ月あればOKとするか
+# 確認月の月末から何ヶ月あればOKとするか（分類ごとに変えられる。これは初期値）
 WARN_MONTHS = 1
 
 STATUS_LABEL = {"ok": "レ", "warn": "×", "expired": "×", "none": ""}
@@ -24,22 +24,22 @@ def month_end(ym: str) -> date:
     return date(y, m, calendar.monthrange(y, m)[1])
 
 
-def ok_limit(ym: str) -> date:
+def ok_limit(ym: str, months: int = WARN_MONTHS) -> date:
     """この日以降の期限なら「レ」。"""
-    return add_months(month_end(ym), WARN_MONTHS)
+    return add_months(month_end(ym), months)
 
 
 def expiry_from_mfg(mfg: date, months: int) -> date:
     return add_months(mfg, months)
 
 
-def judge(expiry: date | None, ym: str, ref: date) -> str:
-    """ok=1ヶ月以上あり / warn=1ヶ月未満 / expired=ref時点で期限切れ / none=期限未入力"""
+def judge(expiry: date | None, ym: str, ref: date, months: int = WARN_MONTHS) -> str:
+    """ok=months以上あり / warn=months未満 / expired=ref時点で期限切れ / none=期限未入力"""
     if expiry is None:
         return "none"
     if expiry < ref:
         return "expired"
-    if expiry < ok_limit(ym):
+    if expiry < ok_limit(ym, months):
         return "warn"
     return "ok"
 

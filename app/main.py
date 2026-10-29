@@ -76,7 +76,7 @@ def category_name(con, category_id: int) -> str:
 def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
     """その月に数える品目（有効な品目＋その月に入力済みの終売品）と入力内容。"""
     sql = """
-        SELECT i.*, c.name AS category_name, c.locations,
+        SELECT i.*, c.name AS category_name, c.locations, c.warn_months,
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.wh_pallets, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
                e.case_weight AS entry_case_weight, e.pallet_cases AS entry_pallet_cases, e.expiry_kind, e.expiry_date, e.mfg_date,
                e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
@@ -155,7 +155,7 @@ def category_detail(ym: str, category_id: int):
         appr = {r["role"]: dict(r) for r in con.execute(
             "SELECT * FROM approvals WHERE ym=? AND category_id=?", (ym, category_id))}
     return {"category": cat, "items": items, "approvals": appr,
-            "month_end": logic.month_end(ym).isoformat(), "ok_limit": logic.ok_limit(ym).isoformat()}
+            "month_end": logic.month_end(ym).isoformat(), "ok_limit": logic.ok_limit(ym, cat["warn_months"]).isoformat()}
 
 
 # ---------- 棚卸入力 ----------
@@ -190,7 +190,7 @@ def check_counted_on(s: str | None, before: dict | None) -> str:
     return d.isoformat()
 
 
-def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
+def build_entry(item: dict, ym: str, body: EntryIn, warn_months: int) -> dict:
     mfg = parse_date(body.mfg_date)
     if item["expiry_mode"] == "none":
         expiry = None
@@ -216,7 +216,7 @@ def build_entry(item: dict, ym: str, body: EntryIn) -> dict:
     elif item["expiry_mode"] == "none":
         status = "ok"
     else:
-        status = logic.judge(expiry, ym, date.today())
+        status = logic.judge(expiry, ym, date.today(), warn_months)
     keep_action = status in ("warn", "expired")
     return {
         "room_cases": body.room_cases, "room_kg": room_kg,
@@ -237,7 +237,8 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
     ym = check_ym(ym)
     with db.connect() as con:
         item = get_item(con, item_id)
-        new = build_entry(item, ym, body)
+        months = con.execute("SELECT warn_months FROM categories WHERE id=?", (item["category_id"],)).fetchone()[0]
+        new = build_entry(item, ym, body, months)
         before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
         new.update(counted_by=user, counted_at=db.now(), counted_on=check_counted_on(body.counted_on, before))
         cols = list(new)
@@ -699,11 +700,13 @@ class CategoryIn(BaseModel):
     grp: str
     name: str
     locations: Literal["split", "single"] = "split"
+    warn_months: int = Field(logic.WARN_MONTHS, ge=1, le=24)
     sort: int = 0
     active: bool = True
 
 
-CATEGORY_LABEL = {"grp": "グループ", "name": "分類名", "locations": "置き場所", "sort": "並び順", "active": "有効"}
+CATEGORY_LABEL = {"grp": "グループ", "name": "分類名", "locations": "置き場所", "warn_months": "判定の月数",
+                  "sort": "並び順", "active": "有効"}
 
 
 @app.get("/api/admin/categories")
@@ -736,6 +739,8 @@ def update_category(category_id: int, body: CategoryIn, user: str = Depends(admi
         change = diff_summary(before, after, CATEGORY_LABEL)
         if change:
             db.record(con, user, "category", category_id, "変更", f"{after['name']}：{change}", before, after)
+        if before["warn_months"] != after["warn_months"]:
+            db.rejudge(con, category_id, after["warn_months"], user)
     return after
 
 
