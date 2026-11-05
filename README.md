@@ -86,10 +86,148 @@
 3. 戻したい日のバックアップを `data\tanaoroshi.db` という名前でコピーする
 4. アプリを起動する
 
-## 開発
+## 技術仕様
+
+### 構成
+
+```
+タブレット / スマホのブラウザ
+        │  HTTP（社内LANのみ、8000番ポート）
+        ▼
+uvicorn ─ FastAPI（app/main.py）
+        ├─ 画面：app/static/ の HTML / CSS / JavaScript をそのまま返す
+        ├─ API：/api/...（JSON、Excel、PDF、PNG）
+        └─ データ：data/tanaoroshi.db（SQLite）と data/docs/（PDF）
+```
+
+サーバーは1台のWindows PCで動かす。DBサーバーやWebサーバー（IIS など）は使わない。画面は外部のCDNを読み込まないので、インターネットにつながっていなくても動く。
+
+### 使っている技術
+
+| 分類 | 内容 |
+|---|---|
+| 言語 | Python 3.12 |
+| Webフレームワーク | FastAPI（入力チェックは pydantic） |
+| アプリケーションサーバー | uvicorn |
+| データベース | SQLite（WALモード、外部キー制約あり） |
+| Excel | openpyxl（.xlsx の出力と取り込み）、xlrd（元の .xls の取り込み） |
+| PDF | pypdfium2（資料のPDFをページごとのPNGにする） |
+| 画面 | 素のJavaScript。フレームワークやビルドの工程はない |
+| テスト | pytest、FastAPI の TestClient |
+
+ライブラリは [requirements.txt](requirements.txt) にあり、`start.bat` が初回にアプリのフォルダの `.venv` へ入れる。
+
+### フォルダ構成
+
+```
+app/
+  main.py          API と画面の配信
+  db.py            テーブル定義、古いDBへの列の追加、変更履歴の記録
+  logic.py         期限の判定と重量の計算
+  export.py        棚卸結果の Excel 出力
+  items_xlsx.py    品目マスタの Excel 出力と一括変更の取り込み
+  expected_xlsx.py 予想在庫の Excel ひな形と取り込み
+  pdf_pages.py     PDF をページごとの PNG にする
+  static/          画面（index.html、app.js、style.css）
+tools/
+  import_master.py 元の .xls から分類と品目を取り込む
+  import_staff.py  staff.txt から担当者を登録する
+  backup.py        DB と資料のバックアップ
+tests/             pytest のテスト
+data/              DB と資料（Git には入れない）
+start.bat          起動
+backup.bat         バックアップ（タスクスケジューラから実行）
+```
+
+### 設定
+
+| 設定 | 内容 | 初期値 |
+|---|---|---|
+| 環境変数 `TANAOROSHI_ADMIN_PIN` | 管理画面のPIN | `1234`（必ず変える） |
+| 環境変数 `TANAOROSHI_DB` | DBファイルの場所。資料はその隣の `docs` フォルダに置く | `data\tanaoroshi.db` |
+| `backup_dir.txt` | バックアップの保存先 | なし（バックアップを使うときに作る） |
+
+### 利用者の識別と権限
+
+- ログインはない。最初に名前を選ぶと端末のブラウザ（localStorage）に覚え、API を呼ぶたびに `X-User` ヘッダーで送る。この名前が入力者と変更履歴の記録に使われる
+- 管理画面の API（`/api/admin/...`）は、`X-Admin-Pin` ヘッダーのPINが合わないと 403 を返す
+- 通信は暗号化しない（HTTP）。社内LANの中だけで使う前提で、インターネットには公開しないこと
+
+### データ
+
+| テーブル | 中身 |
+|---|---|
+| `categories` | 分類。置き場所（資材室と倉庫/パレット、または1か所）、判定の月数 |
+| `items` | 品目マスタ。コード、品名、保管温度、ケース重量、1パレットのケース数、期限の種類 |
+| `staff` | 担当者の名前と並び順 |
+| `entries` | 棚卸の入力。棚卸月と品目ごとに1件 |
+| `expected` | 予想在庫。棚卸月と品目ごとに1件 |
+| `approvals` | 分類ごとの確認（担当者 → 前工程L → 生産管理 → 品管） |
+| `item_docs` | 品目の資料（PDF）。ファイルの実体は `data/docs/<id>.pdf` |
+| `history` | 変更履歴。誰が、いつ、何を変えたかと、変更前後の値（JSON） |
+
+- マスタは消さずに `active=0`（終売・無効）にする。過去の棚卸の記録を残すため
+- 入力には、入力した時点のケース重量と1パレットのケース数を一緒に保存する。あとでマスタを直しても、過去の総重量は変わらない
+- 列を増やしたときは、起動時に `db.init()` が古いDBに列を足す。移行の作業は要らない
+
+### 計算と判定
+
+総重量:
+
+```
+ケース数 = 資材室のケース数 + 倉庫のケース数 + 倉庫のパレット数 × 1パレットのケース数
+総重量(kg) = ケース数 × ケース重量 + 資材室の端数 + 倉庫の端数
+```
+
+端数は、内訳を3つまで入れると合計を端数にする。
+
+期限の判定（`logic.judge`）:
+
+| 結果 | 条件 |
+|---|---|
+| 期限切れ（×） | 期限 < 保存した日 |
+| ○ヶ月以内（×） | 期限 ≦ 棚卸月の月末 + 分類の判定の月数 |
+| レ | それより先 |
+
+- 在庫がゼロの品目と、期限指定なしの品目は判定しない
+- 製造日から期限が決まる品目は、期限 = 製造日 + 品目の月数 で計算する。月末の日付から数えるときは、計算したあとも月末にそろえる
+- 分類の判定の月数を変えると、今月以降の入力を判定し直す（変更履歴に「再判定」として残る）
+- 判定は保存するときにサーバー（`app/logic.py`）で決める。画面（`app/static/app.js`）にも同じ計算があり、入力中の表示に使う。**変えるときは両方を直すこと**
+
+### 主な API
+
+| メソッドとパス | 内容 |
+|---|---|
+| `GET /api/meta` | 分類、担当者、確認の役割など、画面に必要な情報 |
+| `GET /api/months/{ym}/summary` | トップ画面（分類ごとの件数、期限警告の数） |
+| `GET /api/months/{ym}/categories/{id}` | 分類の品目一覧と入力の内容 |
+| `PUT` / `DELETE /api/months/{ym}/items/{id}` | 棚卸の入力の保存と削除 |
+| `PUT /api/months/{ym}/items/{id}/expected` | 予想在庫の保存 |
+| `PUT /api/months/{ym}/items/{id}/action` | ×の品目の対応の記録 |
+| `GET /api/months/{ym}/alerts` | 期限警告の一覧 |
+| `POST` / `DELETE /api/months/{ym}/categories/{id}/approvals...` | 確認の記録と取り消し |
+| `GET /api/months/{ym}/export.xlsx` | 棚卸結果の Excel |
+| `GET /api/items/{id}/docs`、`/api/docs/{id}...` | 資料の一覧、PDF、ページの画像 |
+| `/api/admin/...` | 品目・分類・担当者の編集、Excel の取り込み、資料の追加と削除、変更履歴（PINが必要） |
+
+`{ym}` は棚卸月（`2026-10` の形）。サーバーが動いているときに `http://<サーバーPC名>:8000/docs` を開くと、すべての API の一覧が見られる（このページだけはインターネットから部品を読み込む）。
+
+### 資料（PDF）
+
+- 管理画面で品目ごとに追加する。1ファイル20MBまで
+- タブレットのブラウザではPDFを埋め込めないことがあるので、ページごとにPNGにして見せる（一覧は幅240px、タップすると1200px）
+- `backup.bat` は、保存先の `docs` フォルダにまだないPDFだけをコピーする。アプリで消した資料もバックアップには残る
+
+### 画面の更新
+
+JS と CSS には `Cache-Control: no-cache` を付けて返す。プログラムを更新したら、タブレットは画面を開き直すだけで新しい版になる。
+
+### 開発
+
+テスト:
 
 ```
 .venv\Scripts\python -m pytest -q
 ```
 
-期限判定は `app/logic.py` と `app/static/app.js` の2か所に同じ計算がある。変えるときは両方を直すこと。
+手元で動かすときは `start.bat` を使う。テストは一時フォルダに別のDBを作るので、`data\` の本番データには触らない。
