@@ -68,6 +68,18 @@ a.card { display: block; color: inherit; text-decoration: none; }
 .banner { display: block; border-radius: var(--radius); padding: 14px 16px; text-decoration: none; font-weight: 700; margin-bottom: 8px; }
 .banner.warn { background: var(--warn-bg); color: var(--warn); }
 .banner.ok { background: var(--ok-bg); color: var(--ok); }
+.todo-chip { display: inline-block; background: var(--ng); color: #fff; border-radius: 999px; padding: 1px 10px; margin: 0 4px; }
+.pill.todo { background: var(--ng); color: #fff; font-weight: 700; }
+.item.handled .name { color: var(--sub); }
+.done-mark { color: var(--ok); font-weight: 700; }
+/* 対応の種類ごとの色：--act が文字・帯・選択色、--act-bg が行の背景 */
+.a-plan  { --act: #1f5fbf; --act-bg: #e6effc; }  /* 製造計画に入れる */
+.a-move  { --act: #6b3fa0; --act-bg: #f1e9fa; }  /* 移動 */
+.a-waste { --act: #8a4b14; --act-bg: #f6e9dc; }  /* 廃棄 */
+.a-other { --act: #4f5763; --act-bg: #eceef1; }  /* その他 */
+.item.handled { background: var(--act-bg); box-shadow: inset 6px 0 0 var(--act); }
+.pill.act { background: var(--act); color: #fff; font-weight: 700; }
+.seg button.on[class*="a-"] { background: var(--act); border-color: var(--act); }
 
 .names { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
 .names .btn { min-height: 64px; font-size: 19px; }

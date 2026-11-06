@@ -207,8 +207,8 @@ function renderWho() {
 async function renderHome() {
   const s = await api("GET", `/api/months/${state.ym}/summary`);
   const cats = state.meta.categories;
-  let warn = 0, expired = 0;
-  Object.values(s.categories).forEach((c) => { warn += c.warn; expired += c.expired; });
+  let warn = 0, expired = 0, todo = 0;
+  Object.values(s.categories).forEach((c) => { warn += c.warn; expired += c.expired; todo += c.todo || 0; });
   const groups = [];
   cats.forEach((c) => {
     let g = groups.find((x) => x.name === c.grp);
@@ -219,9 +219,12 @@ async function renderHome() {
   view.innerHTML = `
     <h1>${y}年${m}月の棚卸</h1>
     ${ruleLines(cats)}
-    ${warn + expired
-      ? `<a class="banner warn" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）→ 一覧と対応</a>`
-      : `<a class="banner ok" href="#/alerts">期限警告はありません</a>`}
+    ${!(warn + expired)
+      ? `<a class="banner ok" href="#/alerts">期限警告はありません</a>`
+      : todo
+        ? `<a class="banner warn" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）
+            <span class="todo-chip">未対応 ${todo}件</span> → 一覧と対応</a>`
+        : `<a class="banner ok" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）はすべて対応済み → 一覧</a>`}
     ${groups.map((g) => `
       <h2>${esc(g.name)}</h2>
       <div class="grid">${g.cats.map((c) => catCard(c, s.categories[c.id])).join("")}</div>`).join("")}
@@ -249,7 +252,8 @@ function catCard(c, s) {
   return `<a class="card" href="#/cat/${c.id}">
     <div class="row"><span class="title">${esc(c.name)}</span><span class="spacer"></span>
       ${s.expired ? `<span class="pill s-expired">期限切れ ${s.expired}</span>` : ""}
-      ${s.warn ? `<span class="pill s-warn">× ${s.warn}</span>` : ""}</div>
+      ${s.warn ? `<span class="pill s-warn">× ${s.warn}</span>` : ""}
+      ${s.todo ? `<span class="pill todo">未対応 ${s.todo}</span>` : ""}</div>
     <div class="bar${done ? " done" : ""}"><i style="width:${pct}%"></i></div>
     <div class="row"><span class="muted">入力 ${s.entered} / ${s.total}${s.counted_from ? `・棚卸日 ${mdRange(s.counted_from, s.counted_to)}` : ""}</span><span class="spacer"></span>
       <span class="dots">${state.meta.roles.map((r) => `<span class="dot${s.approvals[r] ? " on" : ""}">${esc(r)}</span>`).join("")}</span></div>
@@ -397,10 +401,14 @@ document.addEventListener("click", (e) => {
   openCalendar(input);
 });
 
+// 対応の種類ごとの色（style.css の .a-*）
+const ACTION_CLASS = { "製造計画に入れる": "a-plan", "移動": "a-move", "廃棄": "a-waste", "その他": "a-other" };
+const actionClass = (a) => ACTION_CLASS[a] || "a-other";
+
 function actionFields(v) {
   return `<div class="box" id="action-box">
     <div class="label">期限切れ・${v.warn_months}ヶ月以内の対応</div>
-    <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${v.action === a ? "on" : ""}">${esc(a)}</button>`).join("")}</div>
+    <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${actionClass(a)}${v.action === a ? " on" : ""}">${esc(a)}</button>`).join("")}</div>
     <div class="field"><span>予定日</span><input type="date" readonly id="action_date" value="${esc(v.action_date || "")}"></div>
     <textarea id="action_note" placeholder="メモ（いつ使う、どこへ移動する など）">${esc(v.action_note || "")}</textarea>
   </div>`;
@@ -558,20 +566,31 @@ function openEntry(it, cat, done) {
 // ---------- 期限警告一覧 ----------
 async function renderAlerts() {
   const d = await api("GET", `/api/months/${state.ym}/alerts`);
+  const row = (it) => {
+    const left = daysLeft(it.expiry_date);
+    return `<button class="item${it.action ? ` handled ${actionClass(it.action)}` : ""}" data-id="${it.id}">
+      <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
+        <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span>
+        <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.doc_count ? `・資料 ${it.doc_count}件` : ""}</span></span>
+      <span class="side"><span class="pill s-${it.status}">${statusLabel(it)}</span><br>
+        ${it.action
+          ? `<span class="done-mark">✓ 対応済</span><br><span class="pill act">${esc(it.action)}</span>${it.action_date ? "<br>" + jdate(it.action_date) : ""}`
+          : `<span class="pill todo">未対応</span>`}</span>
+    </button>`;
+  };
+  const todo = d.items.filter((it) => !it.action);
+  const done = d.items.filter((it) => it.action);
   view.innerHTML = `
     <a class="back" href="#/">← 戻る</a>
     <h1>期限警告一覧</h1>
-    <p class="muted">期限が近い順。タップして対応を記録します。</p>
-    <div class="list">${d.items.length ? d.items.map((it) => {
-      const left = daysLeft(it.expiry_date);
-      return `<button class="item" data-id="${it.id}">
-        <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
-          <br><span class="muted">${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}（${left < 0 ? `${-left}日超過` : `あと${left}日`}）</span>
-          <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.doc_count ? `・資料 ${it.doc_count}件` : ""}</span></span>
-        <span class="side"><span class="pill s-${it.status}">${statusLabel(it)}</span><br>
-          ${it.action ? `<b>${esc(it.action)}</b>${it.action_date ? "<br>" + jdate(it.action_date) : ""}` : `<span style="color:var(--ng)">対応未記入</span>`}</span>
-      </button>`;
-    }).join("") : `<p class="muted" style="padding:14px">警告はありません</p>`}</div>`;
+    ${d.items.length ? `
+      <p class="muted">期限が近い順。タップして対応を記録します。</p>
+      ${todo.length
+        ? `<div class="banner warn">未対応 ${todo.length}件 ／ 対応済み ${done.length}件</div>`
+        : `<div class="banner ok">すべて対応済みです（${done.length}件）</div>`}
+      ${todo.length ? `<h2>未対応（${todo.length}件）</h2><div class="list">${todo.map(row).join("")}</div>` : ""}
+      ${done.length ? `<h2>対応済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`
+    : `<div class="list"><p class="muted" style="padding:14px">警告はありません</p></div>`}`;
   view.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
     const it = d.items.find((x) => x.id === Number(b.dataset.id));
     openSheet(`<h3>${esc(it.name)}</h3>

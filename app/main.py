@@ -122,7 +122,8 @@ def summary(ym: str):
 
     def empty():
         # counted_from / counted_to = その分類を棚卸した最初と最後の日
-        return {"total": 0, "entered": 0, "warn": 0, "expired": 0, "approvals": {},
+        # todo = 期限警告のうち対応が未記入の件数
+        return {"total": 0, "entered": 0, "warn": 0, "expired": 0, "todo": 0, "approvals": {},
                 "counted_from": None, "counted_to": None}
 
     for r in rows:
@@ -135,6 +136,8 @@ def summary(ym: str):
             s["counted_to"] = max(s["counted_to"] or day, day)
             if r["status"] in ("warn", "expired"):
                 s[r["status"]] += 1
+                if not r["action"]:
+                    s["todo"] += 1
     for a in appr:
         out.setdefault(a["category_id"], empty())
         out[a["category_id"]]["approvals"][a["role"]] = a["staff_name"]
