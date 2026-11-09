@@ -267,6 +267,8 @@ async function renderCategory(id) {
   const d = await api("GET", `/api/months/${state.ym}/categories/${id}`);
   const draw = () => {
     const q = catView.q.trim().toLowerCase();
+    const drafts = loadDrafts();
+    const hasDraft = (it) => draftValid(drafts[draftId(it.id)], it);
     const items = d.items.filter((it) => {
       if (catView.filter === "todo" && it.entry_id) return false;
       if (catView.filter === "x" && !["warn", "expired"].includes(it.status)) return false;
@@ -275,7 +277,7 @@ async function renderCategory(id) {
     $("#items").innerHTML = items.length ? items.map((it) => `
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
-        <span class="side"><span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? statusLabel(it) : "未入力"}</span>
+        <span class="side">${hasDraft(it) ? `<span class="pill draft">一時保存</span> ` : ""}<span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? statusLabel(it) : "未入力"}</span>
           ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : !it.total_kg ? "在庫ゼロ" : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
           ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
@@ -284,10 +286,15 @@ async function renderCategory(id) {
     view.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", c.dataset.f === catView.filter));
   };
   const left = d.items.filter((x) => !x.entry_id).length;
+  // この分類で一時保存がある品目（絞り込みに関係なく全部）
+  const allDrafts = loadDrafts();
+  const drafted = d.items.map((it) => ({ it, dr: allDrafts[draftId(it.id)] })).filter((x) => draftValid(x.dr, x.it));
   view.innerHTML = `
     <a class="back" href="#/">← 戻る</a>
     <h1>${esc(d.category.name)}</h1>
     <p class="muted">判定基準：期限が ${jdate(d.ok_limit)} より後なら「レ」、それまでは「×」（月末 ${jdate(d.month_end)} から${d.category.warn_months}ヶ月以内は×）</p>
+    ${drafted.length ? `<div class="banner warn row draft-bar"><span>保存していない入力（一時保存）が ${drafted.length}件あります</span>
+      <span class="spacer"></span><button class="btn primary" type="button" id="save-drafts">まとめて保存</button></div>` : ""}
     <input class="search" id="q" type="search" placeholder="コード・品名で探す" value="${esc(catView.q)}">
     <div class="chips">
       <button class="chip" data-f="all">すべて (${d.items.length})</button>
@@ -305,6 +312,23 @@ async function renderCategory(id) {
             : `<button class="btn primary" data-approve="${esc(r)}">確認する</button>`}
       </div>`;
     }).join("")}</div>`;
+  $("#save-drafts")?.addEventListener("click", async (e) => {
+    const names = drafted.map((x) => `・${x.it.name}`);
+    if (!confirm(`一時保存の ${drafted.length}件を保存しますか？\n\n${names.slice(0, 15).join("\n")}${names.length > 15 ? `\n…ほか${names.length - 15}件` : ""}`)) return;
+    e.target.disabled = true;
+    const failed = [];
+    // 1件ずつ順に保存し、失敗したものは一時保存のまま残す
+    for (const { it, dr } of drafted) {
+      try { await saveEntryValues(it, d.category, dr.values); }
+      catch (err) { failed.push(`${it.name}：${err.message}`); }
+    }
+    const ok = drafted.length - failed.length;
+    if (failed.length) {
+      toast(`${ok}件を保存しました。${failed.length}件は保存できませんでした`, true);
+      alert(`保存できなかった品目（一時保存のまま残しています）\n\n${failed.join("\n")}`);
+    } else toast(`${ok}件を保存しました`);
+    renderCategory(id);
+  });
   $("#q").addEventListener("input", (e) => { catView.q = e.target.value; draw(); });
   view.querySelectorAll(".chip").forEach((c) => c.addEventListener("click", () => { catView.filter = c.dataset.f; draw(); }));
   view.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", async () => {
@@ -331,7 +355,12 @@ function closeSheet() {
   sheet.innerHTML = "";
   document.body.style.overflow = "";
 }
-sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });
+// 外側をタップしたときも「閉じる」ボタンと同じ後始末をする
+sheet.addEventListener("click", (e) => {
+  if (e.target !== sheet) return;
+  const btn = sheet.querySelector("#close");
+  if (btn) btn.click(); else closeSheet();
+});
 
 // ---------- 大きいカレンダー ----------
 // 端末標準の日付ピッカーはタブレットだと小さいので、日付欄（readonly）をタップしたらこちらを出す
@@ -423,6 +452,48 @@ function bindSeg(el, onChange) {
 }
 const segValue = (el) => el.querySelector("button.on")?.dataset.v || "";
 
+// ---------- 入力の一時保存 ----------
+// 保存ボタンを押す前に別の原料を開いても入力が消えないよう、端末（localStorage）に月・品目ごとに残す。
+// 保存・入力取消で消える。30日より古いものは捨てる
+const DRAFT_KEY = "tanaoroshi.drafts";
+const DRAFT_DAYS = 30;
+const draftId = (itemId) => `${state.ym}:${itemId}`;
+function loadDrafts() {
+  let all = {};
+  try { all = JSON.parse(store.get(DRAFT_KEY) || "{}") || {}; } catch {}
+  const limit = Date.now() - DRAFT_DAYS * 86400000;
+  Object.keys(all).forEach((k) => { if (!(all[k]?.at > limit)) delete all[k]; });
+  return all;
+}
+const getDraft = (itemId) => loadDrafts()[draftId(itemId)] || null;
+// 保存済みの入力が一時保存のあとに変わっていなければ有効
+const draftValid = (d, it) => !!d && d.base === (it.counted_at || null);
+// ミリ秒 → "11/9 14:03"
+const fmtAt = (ms) => { const d = new Date(ms); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+function putDraft(itemId, draft) {
+  const all = loadDrafts();
+  if (draft) all[draftId(itemId)] = draft; else delete all[draftId(itemId)];
+  store.set(DRAFT_KEY, Object.keys(all).length ? JSON.stringify(all) : null);
+}
+// シート内の入力欄（id 付き）と選択ボタンの値をまとめて取る／戻す
+function formValues() {
+  const v = {};
+  sheet.querySelectorAll("input[id], textarea[id]").forEach((el) => { v[el.id] = el.value; });
+  sheet.querySelectorAll(".seg[id]").forEach((el) => { v["seg:" + el.id] = segValue(el); });
+  return v;
+}
+function applyFormValues(v) {
+  Object.entries(v).forEach(([k, x]) => {
+    if (k.startsWith("seg:")) {
+      const seg = $("#" + k.slice(4));
+      seg?.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === x));
+    } else {
+      const el = $("#" + k);
+      if (el) el.value = x;
+    }
+  });
+}
+
 function openEntry(it, cat, done) {
   const split = cat.locations === "split";
   const cw = it.entry_id ? it.entry_case_weight ?? it.case_weight : it.case_weight;
@@ -456,8 +527,14 @@ function openEntry(it, cat, done) {
     none: `<div class="muted">この品目は期限の指定がありません</div>`,
   }[it.expiry_mode];
 
+  // 一時保存は、開いた時点の保存済みの入力が同じときだけ戻す（あとで誰かが保存していたら古い）
+  let draft = getDraft(it.id);
+  if (draft && !draftValid(draft, it)) { putDraft(it.id, null); draft = null; }
+
   openSheet(`
     <div class="row"><h3>${esc(it.name)}</h3></div>
+    ${draft ? `<div class="notice row" id="draft-note"><span>保存していない入力（${fmtAt(draft.at)}）を戻しました。「保存」を押すまで確定しません</span>
+      <span class="spacer"></span><button class="btn small" type="button" id="draft-discard">入力を破棄</button></div>` : ""}
     <div class="muted">${esc(it.code)}・${esc(it.storage)}・ケース重量 ${cw ? cw + "kg" : "未設定"}</div>
     <div class="box"><div class="field"><span>棚卸日</span>
         <input type="date" readonly id="counted_on" value="${esc(it.counted_on || localToday())}" max="${localToday()}"></div>
@@ -485,20 +562,20 @@ function openEntry(it, cat, done) {
       <button class="btn primary" type="button" id="save">保存</button>
     </div>`);
 
+  // 開いた直後の値と比べ、変わっていれば一時保存、元に戻れば消す
+  const initial = formValues();
+  if (draft) applyFormValues(draft.values);
+  const persist = () => {
+    if (sheet.hidden) return;
+    const values = formValues();
+    putDraft(it.id, JSON.stringify(values) === JSON.stringify(initial) ? null : { values, base: it.counted_at || null, at: Date.now() });
+  };
+
   const val = (id) => $("#" + id)?.value;
   const partsOf = (key) => Array.from({ length: KG_PARTS }, (_, i) => num(val(`${key}_kg${i}`)));
   const kgOf = (key) => round3(partsOf(key).reduce((a, b) => a + b, 0));
-  const expectedValue = () => { const t = val("expected_kg").trim(); return t === "" ? null : num(t); };
-  // 変わっていれば予想在庫を保存する
-  const saveExpected = async () => {
-    const kg = expectedValue();
-    const as_of = val("expected_as_of") || localToday();
-    if (kg === (it.expected_kg ?? null) && (kg == null || as_of === it.expected_as_of)) return false;
-    const r = await api("PUT", `/api/months/${state.ym}/items/${it.id}/expected`, { kg, as_of });
-    it.expected_kg = kg;
-    it.expected_as_of = r.as_of ?? null;
-    return true;
-  };
+  const expectedValue = () => expectedOf(formValues());
+  const saveExpected = () => saveExpectedValues(it, formValues());
   const recalc = () => {
     const pallets = split && pc ? num(val("wh_pallets")) : 0;
     const cases = round3(num(val("room_cases")) + (split ? num(val("wh_cases")) : 0) + pallets * pc);
@@ -521,6 +598,7 @@ function openEntry(it, cat, done) {
     j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月を超えてあり）` :
       st === "warn" ? `× 月末から${cat.warn_months}ヶ月以内（${jdate(okLimit(state.ym, cat.warn_months))} まで）` : "× 期限切れ";
     $("#action-box").hidden = !["warn", "expired"].includes(st);
+    persist();
   };
   sheet.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => {
     const inp = $("#" + b.dataset.step);
@@ -534,33 +612,77 @@ function openEntry(it, cat, done) {
     recalc();
   }));
   sheet.querySelectorAll("input").forEach((i) => i.addEventListener("input", recalc));
-  bindSeg($("#kind-seg"));
-  bindSeg($("#action-seg"));
+  $("#action_note").addEventListener("input", persist);
+  bindSeg($("#kind-seg"), persist);
+  bindSeg($("#action-seg"), persist);
   loadDocsBox(it);
-  $("#close").addEventListener("click", closeSheet);
+  $("#close").addEventListener("click", () => { closeSheet(); if (getDraft(it.id)) { toast("入力を一時保存しました（まだ確定していません）"); done(); } });
+  $("#draft-discard")?.addEventListener("click", () => {
+    if (!confirm("保存していない入力を破棄しますか？")) return;
+    putDraft(it.id, null);
+    openEntry(it, cat, done);
+    done();
+  });
   $("#del")?.addEventListener("click", async () => {
     if (!confirm("この品目の入力を取り消しますか？")) return;
-    try { await api("DELETE", `/api/months/${state.ym}/items/${it.id}`); closeSheet(); toast("取り消しました"); done(); }
+    try { await api("DELETE", `/api/months/${state.ym}/items/${it.id}`); putDraft(it.id, null); closeSheet(); toast("取り消しました"); done(); }
     catch (e) { toast(e.message, true); }
   });
   $("#save").addEventListener("click", async () => {
-    const body = {
-      room_cases: num(val("room_cases")), room_kg: kgOf("room"), room_kg_parts: partsOf("room"),
-      wh_cases: split ? num(val("wh_cases")) : 0, wh_pallets: split && pc ? num(val("wh_pallets")) : 0, wh_kg: split ? kgOf("wh") : 0, wh_kg_parts: split ? partsOf("wh") : null,
-      expiry_kind: segValue($("#kind-seg")) || "賞",
-      expiry_date: val("expiry_date") || null, mfg_date: val("mfg_date") || null,
-      action: segValue($("#action-seg")), action_date: val("action_date") || null, action_note: val("action_note") || "",
-      counted_on: val("counted_on") || null,
-    };
-    if (body.counted_on && body.counted_on > localToday()) return toast("棚卸日に未来の日付は入れられません", true);
-    try { await saveExpected(); await api("PUT", `/api/months/${state.ym}/items/${it.id}`, body); closeSheet(); toast("保存しました"); done(); }
+    try { await saveEntryValues(it, cat, formValues()); closeSheet(); toast("保存しました"); done(); }
     catch (e) { toast(e.message, true); }
   });
   $("#save-expected").addEventListener("click", async () => {
-    try { if (await saveExpected()) { toast("予想在庫を保存しました"); done(); } else toast("予想在庫は変わっていません"); }
+    try {
+      const saved = await saveExpected();
+      // 予想在庫は確定したので、一時保存の比較元も今の値にする
+      ["expected_kg", "expected_as_of"].forEach((k) => { initial[k] = val(k); });
+      persist();
+      if (saved) { toast("予想在庫を保存しました"); done(); } else toast("予想在庫は変わっていません");
+    }
     catch (e) { toast(e.message, true); }
   });
   recalc();
+}
+
+// ---------- 入力値の保存（入力シートと一時保存の一括保存で共通） ----------
+// f は formValues() の形（入力欄の id → 文字列、"seg:<id>" → 選択値）。シートに無い欄は undefined
+const ENTRY_KG_PARTS = 3;
+const expectedOf = (f) => { const t = (f.expected_kg ?? "").trim(); return t === "" ? null : num(t); };
+
+function entryBody(it, cat, f) {
+  const split = cat.locations === "split";
+  const pc = it.pallet_cases;
+  const partsOf = (key) => Array.from({ length: ENTRY_KG_PARTS }, (_, i) => num(f[`${key}_kg${i}`]));
+  const kgOf = (key) => round3(partsOf(key).reduce((a, b) => a + b, 0));
+  return {
+    room_cases: num(f.room_cases), room_kg: kgOf("room"), room_kg_parts: partsOf("room"),
+    wh_cases: split ? num(f.wh_cases) : 0, wh_pallets: split && pc ? num(f.wh_pallets) : 0, wh_kg: split ? kgOf("wh") : 0, wh_kg_parts: split ? partsOf("wh") : null,
+    expiry_kind: f["seg:kind-seg"] || "賞",
+    expiry_date: f.expiry_date || null, mfg_date: f.mfg_date || null,
+    action: f["seg:action-seg"] || "", action_date: f.action_date || null, action_note: f.action_note || "",
+    counted_on: f.counted_on || null,
+  };
+}
+
+// 変わっていれば予想在庫を保存する
+async function saveExpectedValues(it, f) {
+  const kg = expectedOf(f);
+  const as_of = f.expected_as_of || localToday();
+  if (kg === (it.expected_kg ?? null) && (kg == null || as_of === it.expected_as_of)) return false;
+  const r = await api("PUT", `/api/months/${state.ym}/items/${it.id}/expected`, { kg, as_of });
+  it.expected_kg = kg;
+  it.expected_as_of = r.as_of ?? null;
+  return true;
+}
+
+// 予想在庫と棚卸入力を保存し、一時保存を消す
+async function saveEntryValues(it, cat, f) {
+  const body = entryBody(it, cat, f);
+  if (body.counted_on && body.counted_on > localToday()) throw new Error("棚卸日に未来の日付は入れられません");
+  await saveExpectedValues(it, f);
+  await api("PUT", `/api/months/${state.ym}/items/${it.id}`, body);
+  putDraft(it.id, null);
 }
 
 // ---------- 期限警告一覧 ----------
