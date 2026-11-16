@@ -29,10 +29,28 @@ const mdRange = (from, to) => (from === to ? md(from) : `${md(from)}〜${md(to)}
 const round3 = (v) => Math.round(v * 1000) / 1000;
 // 実在庫 − 予想在庫。どちらかが無ければ null
 const diffKg = (total, expected) => (total == null || expected == null ? null : round3(total - expected));
+// 予想在庫との差が分類の基準を超えているか（サーバーの logic.diff_alert と同じ）
+const diffAlert = (total, expected, cat) => {
+  const d = diffKg(total, expected);
+  return d != null && d !== 0 && Math.abs(d) >= (cat.diff_kg || 0) && Math.abs(d) >= round3(expected * (cat.diff_pct || 0) / 100);
+};
+const diffRule = (cat) => {
+  const parts = [cat.diff_kg ? `${cat.diff_kg}kg以上` : "", cat.diff_pct ? `予想の${cat.diff_pct}%以上` : ""].filter(Boolean);
+  return parts.length ? `${parts.join("、かつ")}の差` : "少しでも差";
+};
 const fmtDiff = (d) => (d == null ? "" : d === 0 ? "差 0kg" : `差 ${d > 0 ? "+" : "−"}${Math.abs(d)}kg`);
 const STATUS = { none: "未入力", ok: "レ", warn: "× 1ヶ月以内", expired: "× 期限切れ" };
 // warn の月数は分類ごとに違う
 const statusLabel = (it) => it.status === "warn" ? `× ${it.warn_months}ヶ月以内` : STATUS[it.status];
+// 再棚卸にする前の入力（なければ null）
+const prevEntry = (it) => (it.prev_entry ? JSON.parse(it.prev_entry) : null);
+const KIND_NAME = { 賞: "賞味期限", 使: "使用期限(開封)", 凍: "冷凍の使用期限", 製: "製造日" };
+// 入力の数量の内訳 "資材室 2ケース＋端数1.5kg／倉庫 パレット1枚＋3ケース"
+function qtyText(e, split) {
+  const part = (cases, kg, pallets) => [pallets ? `パレット${pallets}枚` : "", cases ? `${cases}ケース` : "",
+    kg ? `端数${round3(kg)}kg` : ""].filter(Boolean).join("＋") || "0";
+  return split ? `資材室 ${part(e.room_cases, e.room_kg)}／倉庫 ${part(e.wh_cases, e.wh_kg, e.wh_pallets)}` : part(e.room_cases, e.room_kg);
+}
 
 function toast(msg, err = false) {
   const t = $("#toast");
@@ -182,6 +200,7 @@ async function route() {
     if (parts[0] === "who" || !state.user || !state.meta.staff.includes(state.user)) return renderWho();
     if (parts[0] === "cat") return await renderCategory(Number(parts[1]));
     if (parts[0] === "alerts") return await renderAlerts();
+    if (parts[0] === "diffs") return await renderDiffs();
     return await renderHome();
   } catch (e) {
     view.innerHTML = `<p class="notice">${esc(e.message)}</p>`;
@@ -207,8 +226,8 @@ function renderWho() {
 async function renderHome() {
   const s = await api("GET", `/api/months/${state.ym}/summary`);
   const cats = state.meta.categories;
-  let warn = 0, expired = 0, todo = 0;
-  Object.values(s.categories).forEach((c) => { warn += c.warn; expired += c.expired; todo += c.todo || 0; });
+  let warn = 0, expired = 0, todo = 0, undone = 0, diff = 0, recount = 0;
+  Object.values(s.categories).forEach((c) => { warn += c.warn; expired += c.expired; todo += c.todo || 0; undone += c.undone || 0; diff += c.diff || 0; recount += c.recount || 0; });
   const groups = [];
   cats.forEach((c) => {
     let g = groups.find((x) => x.name === c.grp);
@@ -221,10 +240,13 @@ async function renderHome() {
     ${ruleLines(cats)}
     ${!(warn + expired)
       ? `<a class="banner ok" href="#/alerts">期限警告はありません</a>`
-      : todo
+      : todo + undone
         ? `<a class="banner warn" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）
-            <span class="todo-chip">未対応 ${todo}件</span> → 一覧と対応</a>`
-        : `<a class="banner ok" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）はすべて対応済み → 一覧</a>`}
+            ${todo ? `<span class="todo-chip">未対応 ${todo}件</span>` : ""}${undone ? `<span class="todo-chip undone">未実施 ${undone}件</span>` : ""} → 一覧と対応</a>`
+        : `<a class="banner ok" href="#/alerts">期限警告 ${warn + expired}件（うち期限切れ ${expired}件）はすべて実施済み → 一覧</a>`}
+    ${diff + recount
+      ? `<a class="banner warn" href="#/diffs">予想在庫との差異 ${diff}件${recount ? `<span class="todo-chip">再棚卸待ち ${recount}件</span>` : ""} → 一覧と再棚卸</a>`
+      : `<a class="banner ok" href="#/diffs">予想在庫との差異が大きい品目はありません</a>`}
     ${groups.map((g) => `
       <h2>${esc(g.name)}</h2>
       <div class="grid">${g.cats.map((c) => catCard(c, s.categories[c.id])).join("")}</div>`).join("")}
@@ -246,14 +268,17 @@ function ruleLines(cats) {
 }
 
 function catCard(c, s) {
-  s = s || { total: 0, entered: 0, warn: 0, expired: 0, approvals: {} };
+  s = s || { total: 0, entered: 0, warn: 0, expired: 0, diff: 0, recount: 0, approvals: {} };
   const pct = s.total ? Math.round((s.entered / s.total) * 100) : 0;
   const done = s.total && s.entered === s.total;
   return `<a class="card" href="#/cat/${c.id}">
     <div class="row"><span class="title">${esc(c.name)}</span><span class="spacer"></span>
       ${s.expired ? `<span class="pill s-expired">期限切れ ${s.expired}</span>` : ""}
       ${s.warn ? `<span class="pill s-warn">× ${s.warn}</span>` : ""}
-      ${s.todo ? `<span class="pill todo">未対応 ${s.todo}</span>` : ""}</div>
+      ${s.todo ? `<span class="pill todo">未対応 ${s.todo}</span>` : ""}
+      ${s.undone ? `<span class="pill undone">未実施 ${s.undone}</span>` : ""}
+      ${s.diff ? `<span class="pill diff">差異 ${s.diff}</span>` : ""}
+      ${s.recount ? `<span class="pill recount">再棚卸待ち ${s.recount}</span>` : ""}</div>
     <div class="bar${done ? " done" : ""}"><i style="width:${pct}%"></i></div>
     <div class="row"><span class="muted">入力 ${s.entered} / ${s.total}${s.counted_from ? `・棚卸日 ${mdRange(s.counted_from, s.counted_to)}` : ""}</span><span class="spacer"></span>
       <span class="dots">${state.meta.roles.map((r) => `<span class="dot${s.approvals[r] ? " on" : ""}">${esc(r)}</span>`).join("")}</span></div>
@@ -272,13 +297,16 @@ async function renderCategory(id) {
     const items = d.items.filter((it) => {
       if (catView.filter === "todo" && it.entry_id) return false;
       if (catView.filter === "x" && !["warn", "expired"].includes(it.status)) return false;
+      if (catView.filter === "diff" && !it.diff_alert && !(it.recount_count && !it.entry_id)) return false;
       return !q || it.code.toLowerCase().includes(q) || it.name.toLowerCase().includes(q);
     });
     $("#items").innerHTML = items.length ? items.map((it) => `
       <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
         <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}</span><br><span class="name">${esc(it.name)}</span></span>
-        <span class="side">${hasDraft(it) ? `<span class="pill draft">一時保存</span> ` : ""}<span class="pill s-${it.entry_id ? it.status : "none"}">${it.entry_id ? statusLabel(it) : "未入力"}</span>
-          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : !it.total_kg ? "在庫ゼロ" : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
+        <span class="side">${hasDraft(it) ? `<span class="pill draft">一時保存</span> ` : ""}${it.diff_alert ? `<span class="pill diff">差異大</span> ` : ""}${it.entry_id ? `<span class="pill s-${it.status}">${statusLabel(it)}</span>`
+            : it.recount_count ? `<span class="pill recount">再棚卸待ち</span>` : `<span class="pill s-none">未入力</span>`}
+          ${it.recount_count ? `<br><span class="prev">${it.entry_id ? `再棚卸済${it.recount_count > 1 ? `（${it.recount_count}回）` : ""}・` : ""}前回 ${fmtKg(prevEntry(it).total_kg)}</span>` : ""}
+          ${it.entry_id ? `<br>${fmtKg(it.total_kg)}<br>${it.expiry_date ? jdate(it.expiry_date) : !it.total_kg ? "在庫ゼロ" : it.mfg_date ? `製造日 ${jdate(it.mfg_date)}` : "期限指定無し"}<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}</span>` : ""}
           ${it.expected_kg != null ? `<br><span class="expected">予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}${it.entry_id ? ` <span class="${diffKg(it.total_kg, it.expected_kg) ? "diff-ng" : ""}">${fmtDiff(diffKg(it.total_kg, it.expected_kg))}</span>` : ""}</span>` : ""}</span>
       </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`;
     $("#items").querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () =>
@@ -293,6 +321,7 @@ async function renderCategory(id) {
     <a class="back" href="#/">← 戻る</a>
     <h1>${esc(d.category.name)}</h1>
     <p class="muted">判定基準：期限が ${jdate(d.ok_limit)} より後なら「レ」、それまでは「×」（月末 ${jdate(d.month_end)} から${d.category.warn_months}ヶ月以内は×）</p>
+    <p class="muted">差異の基準：${diffRule(d.category)}があれば「差異大」</p>
     ${drafted.length ? `<div class="banner warn row draft-bar"><span>保存していない入力（一時保存）が ${drafted.length}件あります</span>
       <span class="spacer"></span><button class="btn primary" type="button" id="save-drafts">まとめて保存</button></div>` : ""}
     <input class="search" id="q" type="search" placeholder="コード・品名で探す" value="${esc(catView.q)}">
@@ -300,6 +329,7 @@ async function renderCategory(id) {
       <button class="chip" data-f="all">すべて (${d.items.length})</button>
       <button class="chip" data-f="todo">未入力 (${left})</button>
       <button class="chip" data-f="x">×のみ</button>
+      <button class="chip" data-f="diff">差異・再棚卸 (${d.items.filter((x) => x.diff_alert || (x.recount_count && !x.entry_id)).length})</button>
     </div>
     <div class="list" id="items"></div>
     <h2>確認</h2>
@@ -440,6 +470,18 @@ function actionFields(v) {
     <div class="seg" id="action-seg">${state.meta.actions.map((a) => `<button type="button" data-v="${esc(a)}" class="${actionClass(a)}${v.action === a ? " on" : ""}">${esc(a)}</button>`).join("")}</div>
     <div class="field"><span>予定日</span><input type="date" readonly id="action_date" value="${esc(v.action_date || "")}"></div>
     <textarea id="action_note" placeholder="メモ（いつ使う、どこへ移動する など）">${esc(v.action_note || "")}</textarea>
+    ${v.action_done_by ? `<div class="done-mark">✓ 実施済 ${jdate(v.action_done_on)}（${esc(v.action_done_by)}）</div>` : ""}
+  </div>`;
+}
+// 期限警告の対応を実施したかのチェック欄。対応（予定）が保存されてから使える
+function doneBox(it) {
+  if (!it.action) return `<div class="box"><div class="label">対応の実施</div><div class="muted">対応（予定）を保存すると、実施のチェックができます</div></div>`;
+  return `<div class="box"><div class="label">対応の実施</div>
+    ${it.action_done_by
+      ? `<div class="row"><span class="done-mark">✓ 実施済</span>&nbsp;${jdate(it.action_done_on)}（${esc(it.action_done_by)}）
+          <span class="spacer"></span><button class="btn small danger" type="button" id="undone">実施を取消</button></div>`
+      : `<div class="field"><span>実施日</span><input type="date" readonly id="done_on" value="${localToday()}" max="${localToday()}"></div>
+         <button class="btn primary done-btn" type="button" id="done">実施した（${esc(state.user)}）</button>`}
   </div>`;
 }
 function bindSeg(el, onChange) {
@@ -498,7 +540,15 @@ function openEntry(it, cat, done) {
   const split = cat.locations === "split";
   const cw = it.entry_id ? it.entry_case_weight ?? it.case_weight : it.case_weight;
   const pc = it.pallet_cases; // 1パレットのケース数（保存時はマスタの値で計算する）
-  const v = it.entry_id ? it : { room_cases: 0, room_kg: 0, wh_cases: 0, wh_kg: 0, wh_pallets: 0, expiry_kind: "賞" };
+  // 再棚卸待ちなら、数量は空から数え直し、期限だけ前回の値を入れておく
+  const prev = prevEntry(it);
+  const v = it.entry_id ? it : { room_cases: 0, room_kg: 0, wh_cases: 0, wh_kg: 0, wh_pallets: 0, expiry_kind: prev?.expiry_kind || "賞",
+    expiry_date: prev?.expiry_date, mfg_date: prev?.mfg_date };
+  const prevBox = prev ? `<div class="box prev-box"><div class="row"><span class="label">前回の棚卸（再棚卸${it.recount_count > 1 ? ` ${it.recount_count}回目` : ""}の前）</span>
+      <span class="spacer"></span><span class="total">${fmtKg(prev.total_kg)}</span></div>
+      <div class="muted">${esc(qtyText(prev, split))}</div>
+      <div class="muted">${prev.expiry_date ? `${esc(KIND_NAME[prev.expiry_kind] || prev.expiry_kind)} ${jdate(prev.expiry_date)}・` : prev.mfg_date ? `製造日 ${jdate(prev.mfg_date)}・` : ""}棚卸 ${md(prev.counted_on)} ${esc(prev.counted_by)}${
+        it.expected_kg != null ? `・予想との${fmtDiff(diffKg(prev.total_kg, it.expected_kg))}` : ""}</div></div>` : "";
   // 端数は3か所に分けて入れる。内訳がない古い入力は合計を1つ目に入れる
   const KG_PARTS = 3;
   const kgParts = (key) => {
@@ -520,11 +570,13 @@ function openEntry(it, cat, done) {
       <div class="field"><span>端数</span><div class="kg-parts">${kgParts(key).map((x, i) =>
         `<input class="num" id="${key}_kg${i}" inputmode="decimal" value="${x || ""}" placeholder="0">`).join("")}</div> kg</div>
     </div>`;
+  // 区分「製造日」は砂糖・塩など期限が無いもの用。製造日だけ記録し、期限の判定はしない
+  const mfgField = `<div class="field" id="mfg_wrap"><span>製造日</span><input type="date" readonly id="mfg_date" value="${esc(v.mfg_date || "")}"></div>`;
   const expiryHtml = {
-    date: `<div class="field"><span>期限</span><input type="date" readonly id="expiry_date" value="${esc(v.expiry_date || "")}"></div>`,
-    mfg: `<div class="field"><span>製造日</span><input type="date" readonly id="mfg_date" value="${esc(v.mfg_date || "")}"></div>
-          <div class="muted">期限 = 製造日 ＋ ${it.mfg_months}ヶ月 → <b id="calc_expiry">-</b></div>`,
-    none: `<div class="muted">この品目は期限の指定がありません</div>`,
+    date: `<div class="field" id="expiry_wrap"><span>期限</span><input type="date" readonly id="expiry_date" value="${esc(v.expiry_date || "")}"></div>${mfgField}`,
+    mfg: `${mfgField}
+          <div class="muted" id="calc_wrap">期限 = 製造日 ＋ ${it.mfg_months}ヶ月 → <b id="calc_expiry">-</b></div>`,
+    none: `<div class="muted" id="none_note">この品目は期限の指定がありません</div>${mfgField}`,
   }[it.expiry_mode];
 
   // 一時保存は、開いた時点の保存済みの入力が同じときだけ戻す（あとで誰かが保存していたら古い）
@@ -540,9 +592,10 @@ function openEntry(it, cat, done) {
         <input type="date" readonly id="counted_on" value="${esc(it.counted_on || localToday())}" max="${localToday()}"></div>
       <div class="muted">${it.entry_id ? `最後の保存：${jdatetime(it.counted_at)}（${esc(it.counted_by)}）` : "今日の日付が入ります。別の日に数えた分はここで直してください"}</div></div>
     ${cw ? "" : `<div class="notice">ケース重量が未設定です。ケース数ではなく「端数」に重さ(kg)を入れてください。</div>`}
+    ${prevBox}
     ${split ? loc("room", "資材室") + loc("wh", "倉庫／パレット") : loc("room", "在庫")}
     <div class="box"><div class="row"><span class="label">総重量</span><span class="spacer"></span><span class="total" id="total">0kg</span></div>
-      <div class="muted" id="formula"></div></div>
+      <div class="muted" id="formula"></div>${prev ? `<div class="muted" id="prev_diff"></div>` : ""}</div>
     <div class="box"><div class="label">予想在庫</div>
       <div class="field"><span>予想</span><input class="num" id="expected_kg" inputmode="decimal" value="${it.expected_kg ?? ""}" placeholder="未入力"> kg
         <button class="btn small" type="button" id="save-expected">予想だけ保存</button></div>
@@ -550,7 +603,7 @@ function openEntry(it, cat, done) {
       <div class="muted">${it.expected_kg != null ? `いつの時点の予想在庫かを入れてください（最後の保存：${jdate(it.expected_as_of)}時点）` : "いつの時点の予想在庫かを入れてください"}</div>
       <div class="muted" id="expected_diff"></div></div>
     <div class="box"><div class="label">賞味期限・使用期限</div>
-      <div class="seg" id="kind-seg" data-required="1">${["賞", "使", "凍"].map((k) => `<button type="button" data-v="${k}" class="${v.expiry_kind === k ? "on" : ""}">${{ 賞: "賞味期限", 使: "使用期限(開封)", 凍: "冷凍の使用期限" }[k]}</button>`).join("")}</div>
+      <div class="seg" id="kind-seg" data-required="1">${["賞", "使", "凍", "製"].map((k) => `<button type="button" data-v="${k}" class="${v.expiry_kind === k ? "on" : ""}">${KIND_NAME[k]}</button>`).join("")}</div>
       ${expiryHtml}
       <div class="judge s-none" id="judge"></div>
     </div>
@@ -558,7 +611,8 @@ function openEntry(it, cat, done) {
     ${actionFields({ ...v, warn_months: cat.warn_months })}
     <div class="actions-bar">
       <button class="btn" type="button" id="close">閉じる</button>
-      ${it.entry_id ? `<button class="btn danger" type="button" id="del">入力取消</button>` : ""}
+      ${it.entry_id ? `<button class="btn danger" type="button" id="del">入力取消</button>
+        <button class="btn" type="button" id="recount">再棚卸</button>` : prev ? `<button class="btn" type="button" id="recount-cancel">再棚卸を取消</button>` : ""}
       <button class="btn primary" type="button" id="save">保存</button>
     </div>`);
 
@@ -585,17 +639,27 @@ function openEntry(it, cat, done) {
     const exp = expectedValue();
     const d = diffKg(total, exp);
     $("#expected_diff").textContent = exp == null ? "入れると総重量との差を表示します" : `総重量 ${total}kg − 予想 ${exp}kg（${jdate(val("expected_as_of") || localToday())}時点） → ${fmtDiff(d)}`;
-    $("#expected_diff").className = d ? "diff-ng" : "muted";
+    const big = diffAlert(total, exp, cat);
+    if (big) $("#expected_diff").textContent += `　差異が大きいです（${diffRule(cat)}）。数え直すときは保存後に「再棚卸」`;
+    $("#expected_diff").className = big ? "diff-ng diff-big" : d ? "diff-ng" : "muted";
     const pl = pallets ? `（うちパレット ${pallets}枚 × ${pc}ケース）` : "";
     $("#formula").textContent = cw ? `${cases}ケース${pl} × ${cw}kg ＋ 端数 ${loose}kg` : `端数の合計 ${loose}kg`;
+    if (prev) {
+      const pd = diffKg(total, prev.total_kg);
+      $("#prev_diff").textContent = `今回 ${total}kg − 前回 ${round3(prev.total_kg)}kg → ${fmtDiff(pd)}`;
+      $("#prev_diff").className = pd ? "diff-ng" : "muted";
+    }
+    const byMfg = segValue($("#kind-seg")) === "製";
+    $("#mfg_wrap").hidden = it.expiry_mode !== "mfg" && !byMfg;
+    ["expiry_wrap", "calc_wrap", "none_note"].forEach((id) => { if ($("#" + id)) $("#" + id).hidden = byMfg; });
     let expiry = null;
     if (it.expiry_mode === "date") expiry = val("expiry_date") || null;
     if (it.expiry_mode === "mfg" && val("mfg_date")) { expiry = addMonths(val("mfg_date"), it.mfg_months); $("#calc_expiry").textContent = jdate(expiry); }
-    // 在庫ゼロなら期限は入れなくてよい（サーバーも判定しない）
-    const st = !total || it.expiry_mode === "none" ? "ok" : judge(expiry, state.ym, cat.warn_months);
+    // 在庫ゼロなら期限は入れなくてよい（サーバーも判定しない）。製造日は判定しない
+    const st = !total || it.expiry_mode === "none" || byMfg ? "ok" : judge(expiry, state.ym, cat.warn_months);
     const j = $("#judge");
-    j.className = `judge s-${st}`;
-    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月を超えてあり）` :
+    j.className = `judge s-${byMfg && total && !val("mfg_date") ? "none" : st}`;
+    j.textContent = !total ? "在庫ゼロのため期限の入力は不要です" : byMfg ? (val("mfg_date") ? "製造日で管理（期限が無いため判定しません）" : "製造日を入れてください") : st === "none" ? "期限を入れると判定します" : st === "ok" ? `レ（${cat.warn_months}ヶ月を超えてあり）` :
       st === "warn" ? `× 月末から${cat.warn_months}ヶ月以内（${jdate(okLimit(state.ym, cat.warn_months))} まで）` : "× 期限切れ";
     $("#action-box").hidden = !["warn", "expired"].includes(st);
     persist();
@@ -613,7 +677,7 @@ function openEntry(it, cat, done) {
   }));
   sheet.querySelectorAll("input").forEach((i) => i.addEventListener("input", recalc));
   $("#action_note").addEventListener("input", persist);
-  bindSeg($("#kind-seg"), persist);
+  bindSeg($("#kind-seg"), recalc);
   bindSeg($("#action-seg"), persist);
   loadDocsBox(it);
   $("#close").addEventListener("click", () => { closeSheet(); if (getDraft(it.id)) { toast("入力を一時保存しました（まだ確定していません）"); done(); } });
@@ -626,6 +690,16 @@ function openEntry(it, cat, done) {
   $("#del")?.addEventListener("click", async () => {
     if (!confirm("この品目の入力を取り消しますか？")) return;
     try { await api("DELETE", `/api/months/${state.ym}/items/${it.id}`); putDraft(it.id, null); closeSheet(); toast("取り消しました"); done(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $("#recount")?.addEventListener("click", async () => {
+    if (!confirm("再棚卸にしますか？\n\n今の入力は「前回の棚卸」として残り、この品目は未入力に戻ります。数え直したら入力してください。")) return;
+    try { await api("POST", `/api/months/${state.ym}/items/${it.id}/recount`); putDraft(it.id, null); closeSheet(); toast("再棚卸にしました"); done(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $("#recount-cancel")?.addEventListener("click", async () => {
+    if (!confirm(`再棚卸をやめて、前回の入力（${fmtKg(prev.total_kg)}）に戻しますか？`)) return;
+    try { await api("DELETE", `/api/months/${state.ym}/items/${it.id}/recount`); putDraft(it.id, null); closeSheet(); toast("前回の入力に戻しました"); done(); }
     catch (e) { toast(e.message, true); }
   });
   $("#save").addEventListener("click", async () => {
@@ -696,22 +770,27 @@ async function renderAlerts() {
         <br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.doc_count ? `・資料 ${it.doc_count}件` : ""}</span></span>
       <span class="side"><span class="pill s-${it.status}">${statusLabel(it)}</span><br>
         ${it.action
-          ? `<span class="done-mark">✓ 対応済</span><br><span class="pill act">${esc(it.action)}</span>${it.action_date ? "<br>" + jdate(it.action_date) : ""}`
+          ? `<span class="pill act">${esc(it.action)}</span>${it.action_date ? `<br>予定 ${jdate(it.action_date)}` : ""}<br>${it.action_done_by
+            ? `<span class="done-mark">✓ 実施済 ${md(it.action_done_on)}</span><br><span class="counted">${esc(it.action_done_by)}</span>`
+            : `<span class="pill undone">未実施</span>`}`
           : `<span class="pill todo">未対応</span>`}</span>
     </button>`;
   };
+  // 未対応（予定なし）→ 未実施（予定あり）→ 実施済み
   const todo = d.items.filter((it) => !it.action);
-  const done = d.items.filter((it) => it.action);
+  const undone = d.items.filter((it) => it.action && !it.action_done_by);
+  const done = d.items.filter((it) => it.action_done_by);
   view.innerHTML = `
     <a class="back" href="#/">← 戻る</a>
     <h1>期限警告一覧</h1>
     ${d.items.length ? `
-      <p class="muted">期限が近い順。タップして対応を記録します。</p>
-      ${todo.length
-        ? `<div class="banner warn">未対応 ${todo.length}件 ／ 対応済み ${done.length}件</div>`
-        : `<div class="banner ok">すべて対応済みです（${done.length}件）</div>`}
-      ${todo.length ? `<h2>未対応（${todo.length}件）</h2><div class="list">${todo.map(row).join("")}</div>` : ""}
-      ${done.length ? `<h2>対応済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`
+      <p class="muted">期限が近い順。タップして対応（予定）を記録し、実施したら「実施した」でチェックします。</p>
+      ${todo.length + undone.length
+        ? `<div class="banner warn">未対応 ${todo.length}件 ／ 未実施 ${undone.length}件 ／ 実施済み ${done.length}件</div>`
+        : `<div class="banner ok">すべて実施済みです（${done.length}件）</div>`}
+      ${todo.length ? `<h2>未対応（${todo.length}件）</h2><p class="muted">対応の予定がまだ入っていません</p><div class="list">${todo.map(row).join("")}</div>` : ""}
+      ${undone.length ? `<h2>未実施（${undone.length}件）</h2><p class="muted">予定は入っています。実施したらチェックしてください</p><div class="list">${undone.map(row).join("")}</div>` : ""}
+      ${done.length ? `<h2>実施済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`
     : `<div class="list"><p class="muted" style="padding:14px">警告はありません</p></div>`}`;
   view.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
     const it = d.items.find((x) => x.id === Number(b.dataset.id));
@@ -719,18 +798,78 @@ async function renderAlerts() {
       <div class="muted">${esc(it.code)}・${fmtKg(it.total_kg)}・${esc(it.expiry_kind)} ${jdate(it.expiry_date)}</div>
       ${docsBox(it)}
       ${actionFields(it)}
+      ${doneBox(it)}
       <div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="save">保存</button></div>`);
     bindSeg($("#action-seg"));
     loadDocsBox(it);
+    const fields = () => ({ action: segValue($("#action-seg")), action_date: $("#action_date").value || null, action_note: $("#action_note").value });
+    // 対応の欄が保存した内容から変わっていれば保存する
+    const saveAction = async () => {
+      const f = fields();
+      if (f.action === (it.action || "") && f.action_date === (it.action_date || null) && f.action_note === (it.action_note || "")) return false;
+      await api("PUT", `/api/months/${state.ym}/items/${it.id}/action`, f);
+      return true;
+    };
     $("#close").addEventListener("click", closeSheet);
     $("#save").addEventListener("click", async () => {
+      try { await saveAction(); closeSheet(); toast("保存しました"); renderAlerts(); }
+      catch (e) { toast(e.message, true); }
+    });
+    $("#done")?.addEventListener("click", async () => {
+      const f = fields();
+      if (!f.action) return toast("対応を選んでください", true);
+      if (f.action !== it.action && !confirm(`対応を「${f.action}」に変えて、実施済みにしますか？`)) return;
+      const done_on = $("#done_on").value || localToday();
+      if (done_on > localToday()) return toast("実施日に未来の日付は入れられません", true);
       try {
-        await api("PUT", `/api/months/${state.ym}/items/${it.id}/action`, {
-          action: segValue($("#action-seg")), action_date: $("#action_date").value || null, action_note: $("#action_note").value,
-        });
-        closeSheet(); toast("保存しました"); renderAlerts();
+        await saveAction();
+        await api("PUT", `/api/months/${state.ym}/items/${it.id}/action/done`, { done_on });
+        closeSheet(); toast("実施済みにしました"); renderAlerts();
       } catch (e) { toast(e.message, true); }
     });
+    $("#undone")?.addEventListener("click", async () => {
+      if (!confirm("実施のチェックを取り消しますか？")) return;
+      try { await api("DELETE", `/api/months/${state.ym}/items/${it.id}/action/done`); closeSheet(); toast("取り消しました"); renderAlerts(); }
+      catch (e) { toast(e.message, true); }
+    });
+  }));
+}
+
+// ---------- 差異一覧（予想在庫との差が大きい品目） ----------
+async function renderDiffs() {
+  const d = await api("GET", `/api/months/${state.ym}/diffs`);
+  // 入力シートに要る分類の設定は品目の行に入っている（使わなくなった分類でも開ける）
+  const catOf = (it) => ({ id: it.category_id, name: it.category_name, locations: it.locations,
+    warn_months: it.warn_months, diff_pct: it.diff_pct, diff_kg: it.diff_kg });
+  const row = (it) => {
+    const prev = prevEntry(it);
+    const df = it.entry_id ? diffKg(it.total_kg, it.expected_kg) : prev ? diffKg(prev.total_kg, it.expected_kg) : null;
+    return `<button class="item" data-id="${it.id}">
+      <span class="main"><span class="code">${esc(it.category_name)}・${esc(it.code)}</span><br><span class="name">${esc(it.name)}</span>
+        <br><span class="muted">${it.entry_id ? `実在庫 ${fmtKg(it.total_kg)}` : `前回 ${fmtKg(prev?.total_kg)}`}・予想 ${fmtKg(it.expected_kg)}${it.expected_as_of ? `（${md(it.expected_as_of)}時点）` : ""}</span>
+        ${it.entry_id ? `<br><span class="counted">棚卸 ${md(it.counted_on)} ${esc(it.counted_by)}${it.recount_count ? `・前回 ${fmtKg(prev.total_kg)}` : ""}</span>` : ""}</span>
+      <span class="side">${it.entry_id ? `<span class="pill diff">差異大</span>` : `<span class="pill recount">再棚卸待ち</span>`}
+        ${df != null ? `<br><span class="diff-ng">${fmtDiff(df)}</span>` : ""}
+        ${df != null && it.expected_kg ? `<br><span class="muted">${Math.round(Math.abs(df) / it.expected_kg * 1000) / 10}%</span>` : ""}</span>
+    </button>`;
+  };
+  // 差異あり（まだ数え直していない）→ 再棚卸待ち → 数え直しても差異あり
+  const fresh = d.items.filter((it) => it.entry_id && !it.recount_count);
+  const waiting = d.items.filter((it) => !it.entry_id);
+  const still = d.items.filter((it) => it.entry_id && it.recount_count);
+  const section = (title, note, list) => list.length ? `<h2>${title}（${list.length}件）</h2><p class="muted">${note}</p><div class="list">${list.map(row).join("")}</div>` : "";
+  view.innerHTML = `
+    <a class="back" href="#/">← 戻る</a>
+    <h1>予想在庫との差異</h1>
+    ${d.items.length ? `
+      <p class="muted">差の大きい順。タップすると入力シートが開き、「再棚卸」で数え直しにできます。基準は分類ごと（管理画面の「分類」で変更）。</p>
+      ${section("差異あり", "まだ数え直していない品目です", fresh)}
+      ${section("再棚卸待ち", "数え直して入力してください", waiting)}
+      ${section("再棚卸後も差異あり", "数え直しても差が残っています。予想在庫の数字も確認してください", still)}`
+    : `<div class="list"><p class="muted" style="padding:14px">差異が大きい品目はありません</p></div>`}`;
+  view.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
+    const it = d.items.find((x) => x.id === Number(b.dataset.id));
+    openEntry(it, catOf(it), renderDiffs);
   }));
 }
 
@@ -952,24 +1091,28 @@ async function adminCategories() {
   const cats = await api("GET", "/api/admin/categories");
   const el = $("#admin");
   el.innerHTML = `<div class="row"><span class="spacer"></span><button class="btn primary" id="add">＋ 分類を追加</button></div>
-    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>並び順</th><th>グループ</th><th>分類名</th><th>置き場所</th><th>判定</th><th>状態</th></tr></thead>
+    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>並び順</th><th>グループ</th><th>分類名</th><th>置き場所</th><th>判定</th><th>差異の基準</th><th>状態</th></tr></thead>
     <tbody>${cats.map((c) => `<tr class="click" data-id="${c.id}"><td>${c.sort}</td><td>${esc(c.grp)}</td><td>${esc(c.name)}</td>
-      <td>${c.locations === "split" ? "資材室＋倉庫" : "1か所"}</td><td>月末から${c.warn_months}ヶ月</td><td>${c.active ? "有効" : "使わない"}</td></tr>`).join("")}</tbody></table></div>`;
+      <td>${c.locations === "split" ? "資材室＋倉庫" : "1か所"}</td><td>月末から${c.warn_months}ヶ月</td><td>${esc(diffRule(c))}</td><td>${c.active ? "有効" : "使わない"}</td></tr>`).join("")}</tbody></table></div>`;
   const form = (c) => {
-    const v = c || { grp: "", name: "", locations: "split", warn_months: state.meta.warn_months, sort: (cats.at(-1)?.sort || 0) + 10, active: 1 };
+    const v = c || { grp: "", name: "", locations: "split", warn_months: state.meta.warn_months, diff_pct: state.meta.diff_pct, diff_kg: state.meta.diff_kg, sort: (cats.at(-1)?.sort || 0) + 10, active: 1 };
     openSheet(`<h3>${c ? "分類を変更" : "分類を追加"}</h3><div class="form-grid" style="margin-top:12px">
       <label>グループ（トップ画面の見出し）<input class="text" id="c_grp" value="${esc(v.grp)}"></label>
       <label>分類名<input class="text" id="c_name" value="${esc(v.name)}"></label>
       <label>置き場所<select id="c_loc"><option value="split" ${v.locations === "split" ? "selected" : ""}>資材室と倉庫/パレットに分ける</option><option value="single" ${v.locations === "single" ? "selected" : ""}>1か所</option></select></label>
       <label>判定の月数（月末から何ヶ月あれば「レ」か）<input class="text" id="c_months" inputmode="numeric" value="${v.warn_months}"></label>
+      <label>差異の基準(kg)（予想在庫と何kg以上違ったら「差異大」か）<input class="text" id="c_dkg" inputmode="decimal" value="${v.diff_kg}"></label>
+      <label>差異の基準(%)（割合でも絞るとき。0なら割合では見ない）<input class="text" id="c_dpct" inputmode="decimal" value="${v.diff_pct}"></label>
       <label>並び順<input class="text" id="c_sort" inputmode="numeric" value="${v.sort}"></label>
       <label>状態<select id="c_active"><option value="1" ${v.active ? "selected" : ""}>有効</option><option value="0" ${v.active ? "" : "selected"}>使わない</option></select></label>
       </div><div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="save">保存</button></div>`);
     $("#close").addEventListener("click", closeSheet);
     $("#save").addEventListener("click", async () => {
-      const body = { grp: $("#c_grp").value.trim(), name: $("#c_name").value.trim(), locations: $("#c_loc").value, warn_months: Number($("#c_months").value), sort: Number($("#c_sort").value) || 0, active: $("#c_active").value === "1" };
+      const body = { grp: $("#c_grp").value.trim(), name: $("#c_name").value.trim(), locations: $("#c_loc").value, warn_months: Number($("#c_months").value), diff_pct: Number($("#c_dpct").value), diff_kg: Number($("#c_dkg").value), sort: Number($("#c_sort").value) || 0, active: $("#c_active").value === "1" };
       if (!body.grp || !body.name) return toast("グループと分類名を入れてください", true);
       if (!Number.isInteger(body.warn_months) || body.warn_months < 1 || body.warn_months > 24) return toast("判定の月数は1〜24で入れてください", true);
+      if (!(body.diff_pct >= 0 && body.diff_pct <= 100)) return toast("差異の基準(%)は0〜100で入れてください", true);
+      if (!(body.diff_kg >= 0)) return toast("差異の基準(kg)は0以上で入れてください", true);
       try {
         await api(c ? "PUT" : "POST", c ? `/api/admin/categories/${c.id}` : "/api/admin/categories", body);
         closeSheet(); toast("保存しました"); state.meta = await api("GET", "/api/meta"); adminCategories();

@@ -76,24 +76,31 @@ def category_name(con, category_id: int) -> str:
 def month_items(con, ym: str, category_id: int | None = None) -> list[dict]:
     """その月に数える品目（有効な品目＋その月に入力済みの終売品）と入力内容。"""
     sql = """
-        SELECT i.*, c.name AS category_name, c.locations, c.warn_months,
+        SELECT i.*, c.name AS category_name, c.locations, c.warn_months, c.diff_pct, c.diff_kg,
                e.id AS entry_id, e.room_cases, e.room_kg, e.wh_cases, e.wh_kg, e.wh_pallets, e.room_kg_parts, e.wh_kg_parts, e.total_kg,
                e.case_weight AS entry_case_weight, e.pallet_cases AS entry_pallet_cases, e.expiry_kind, e.expiry_date, e.mfg_date,
-               e.status, e.action, e.action_date, e.action_note, e.counted_by, e.counted_at, e.counted_on,
+               e.status, e.action, e.action_date, e.action_note, e.action_done_by, e.action_done_on, e.counted_by, e.counted_at, e.counted_on,
                x.kg AS expected_kg, x.as_of AS expected_as_of,
-               (SELECT COUNT(*) FROM item_docs d WHERE d.item_id = i.id) AS doc_count
+               (SELECT COUNT(*) FROM item_docs d WHERE d.item_id = i.id) AS doc_count,
+               (SELECT COUNT(*) FROM recounts r WHERE r.ym = ? AND r.item_id = i.id) AS recount_count,
+               (SELECT r.entry_json FROM recounts r WHERE r.ym = ? AND r.item_id = i.id
+                ORDER BY r.id DESC LIMIT 1) AS prev_entry
         FROM items i
         JOIN categories c ON c.id = i.category_id
         LEFT JOIN entries e ON e.item_id = i.id AND e.ym = ?
         LEFT JOIN expected x ON x.item_id = i.id AND x.ym = ?
         WHERE (i.active = 1 OR e.id IS NOT NULL)
     """
-    args: list = [ym, ym]
+    args: list = [ym, ym, ym, ym]
     if category_id is not None:
         sql += " AND i.category_id = ?"
         args.append(category_id)
     sql += " ORDER BY c.sort, i.sort, i.code"
-    return [dict(r) for r in con.execute(sql, args)]
+    rows = [dict(r) for r in con.execute(sql, args)]
+    for r in rows:
+        # 予想在庫との差が分類の基準を超えているか（入力済みで予想在庫があるときだけ）
+        r["diff_alert"] = bool(r["entry_id"]) and logic.diff_alert(r["total_kg"], r["expected_kg"], r["diff_pct"], r["diff_kg"])
+    return rows
 
 
 # ---------- 基本情報 ----------
@@ -108,6 +115,7 @@ def meta():
     return {
         "categories": cats, "staff": staff, "roles": ROLES, "role_hint": ROLE_HINT,
         "actions": ACTIONS, "storages": STORAGES, "warn_months": logic.WARN_MONTHS,
+        "diff_pct": logic.DIFF_PCT, "diff_kg": logic.DIFF_KG,
         "today": date.today().isoformat(),
     }
 
@@ -123,12 +131,18 @@ def summary(ym: str):
     def empty():
         # counted_from / counted_to = その分類を棚卸した最初と最後の日
         # todo = 期限警告のうち対応が未記入の件数
-        return {"total": 0, "entered": 0, "warn": 0, "expired": 0, "todo": 0, "approvals": {},
+        # undone = 対応の予定は入っているが、実施のチェックがない件数
+        # diff = 予想在庫との差異が大きく、まだ再棚卸していない件数 / recount = 再棚卸待ちの件数
+        return {"total": 0, "entered": 0, "warn": 0, "expired": 0, "todo": 0, "undone": 0, "diff": 0, "recount": 0, "approvals": {},
                 "counted_from": None, "counted_to": None}
 
     for r in rows:
         s = out.setdefault(r["category_id"], empty())
         s["total"] += 1
+        if r["diff_alert"] and not r["recount_count"]:
+            s["diff"] += 1
+        if not r["entry_id"] and r["recount_count"]:
+            s["recount"] += 1
         if r["entry_id"]:
             s["entered"] += 1
             day = r["counted_on"]
@@ -138,6 +152,8 @@ def summary(ym: str):
                 s[r["status"]] += 1
                 if not r["action"]:
                     s["todo"] += 1
+                elif not r["action_done_by"]:
+                    s["undone"] += 1
     for a in appr:
         out.setdefault(a["category_id"], empty())
         out[a["category_id"]]["approvals"][a["role"]] = a["staff_name"]
@@ -172,7 +188,7 @@ class EntryIn(BaseModel):
     # 端数の内訳（最大3つ）。あれば合計を room_kg / wh_kg にする
     room_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
     wh_kg_parts: list[Annotated[float, Field(ge=0)]] | None = Field(None, max_length=3)
-    expiry_kind: Literal["賞", "使", "凍"] = "賞"
+    expiry_kind: Literal["賞", "使", "凍", "製"] = "賞"  # 製=製造日（期限が無い品。判定しない）
     expiry_date: str | None = None
     mfg_date: str | None = None
     action: str = ""
@@ -195,7 +211,10 @@ def check_counted_on(s: str | None, before: dict | None) -> str:
 
 def build_entry(item: dict, ym: str, body: EntryIn, warn_months: int) -> dict:
     mfg = parse_date(body.mfg_date)
-    if item["expiry_mode"] == "none":
+    by_mfg = body.expiry_kind == "製"
+    if not by_mfg and item["expiry_mode"] != "mfg":
+        mfg = None  # 製造日の欄が無い入力なので残さない
+    if by_mfg or item["expiry_mode"] == "none":
         expiry = None
     elif item["expiry_mode"] == "mfg":
         expiry = logic.expiry_from_mfg(mfg, item["mfg_months"] or 0) if mfg else None
@@ -211,6 +230,10 @@ def build_entry(item: dict, ym: str, body: EntryIn, warn_months: int) -> dict:
     total = logic.total_kg(cw, cases, room_kg + wh_kg)
     # 在庫ゼロなら期限は入れなくてよく、判定もしない
     if not total:
+        status = "ok"
+    elif by_mfg:
+        if not mfg:
+            raise HTTPException(400, "製造日を入れてください")
         status = "ok"
     elif item["expiry_mode"] == "date" and not expiry:
         raise HTTPException(400, "期限の日付を入れてください")
@@ -244,6 +267,10 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
         new = build_entry(item, ym, body, months)
         before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
         new.update(counted_by=user, counted_at=db.now(), counted_on=check_counted_on(body.counted_on, before))
+        # 実施のチェックは、対応の種類が変わらない間だけ残す
+        keep_done = before and new["action"] and before["action"] == new["action"]
+        new.update(action_done_by=before["action_done_by"] if keep_done else None,
+                   action_done_on=before["action_done_on"] if keep_done else None)
         cols = list(new)
         con.execute(
             f"INSERT INTO entries (ym, item_id, {', '.join(cols)}) VALUES (?, ?, {', '.join('?' * len(cols))})"
@@ -269,6 +296,48 @@ def delete_entry(ym: str, item_id: int, user: str = Depends(actor)):
         con.execute("DELETE FROM entries WHERE id=?", (before["id"],))
         db.record(con, user, "entry", before["id"], "取消", f"{ym} {item['code']} {item['name']}", before, None)
     return {"ok": True}
+
+
+@app.post("/api/months/{ym}/items/{item_id}/recount")
+def start_recount(ym: str, item_id: int, user: str = Depends(actor)):
+    """再棚卸にする。今の入力を前回分として残し、その品目を未入力に戻す。"""
+    ym = check_ym(ym)
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        if not before:
+            raise HTTPException(404, "入力がありません")
+        cur = con.execute("INSERT INTO recounts (ym, item_id, entry_json, requested_by, requested_at) VALUES (?,?,?,?,?)",
+                          (ym, item_id, json.dumps(before, ensure_ascii=False), user, db.now()))
+        con.execute("DELETE FROM entries WHERE id=?", (before["id"],))
+        n = con.execute("SELECT COUNT(*) FROM recounts WHERE ym=? AND item_id=?", (ym, item_id)).fetchone()[0]
+        db.record(con, user, "entry", before["id"], "再棚卸",
+                  f"{ym} {item['code']} {item['name']} {n}回目 前回{before['total_kg']}kg"
+                  f"（棚卸日{before['counted_on']} {before['counted_by']}）", before, None)
+    return {"ok": True, "recount_id": cur.lastrowid, "recount_count": n}
+
+
+@app.delete("/api/months/{ym}/items/{item_id}/recount")
+def cancel_recount(ym: str, item_id: int, user: str = Depends(actor)):
+    """再棚卸をやめて、前回の入力に戻す。数え直した入力がある間は戻さない。"""
+    ym = check_ym(ym)
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        rc = con.execute("SELECT * FROM recounts WHERE ym=? AND item_id=? ORDER BY id DESC LIMIT 1",
+                         (ym, item_id)).fetchone()
+        if not rc:
+            raise HTTPException(404, "再棚卸になっていません")
+        if con.execute("SELECT 1 FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone():
+            raise HTTPException(409, "数え直した入力があるため戻せません。先に入力を取り消してください")
+        prev = json.loads(rc["entry_json"])
+        cols = [c for c in prev if c != "id"]
+        con.execute(f"INSERT INTO entries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    [prev[c] for c in cols])
+        con.execute("DELETE FROM recounts WHERE id=?", (rc["id"],))
+        after = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        db.record(con, user, "entry", after["id"], "再棚卸取消",
+                  f"{ym} {item['code']} {item['name']} 前回{after['total_kg']}kgに戻す", None, after)
+    return after
 
 
 class ExpectedIn(BaseModel):
@@ -324,9 +393,54 @@ def save_action(ym: str, item_id: int, body: ActionIn, user: str = Depends(actor
             raise HTTPException(404, "先に棚卸を入力してください")
         con.execute("UPDATE entries SET action=?, action_date=?, action_note=? WHERE id=?",
                     (body.action, body.action_date or None, body.action_note, before["id"]))
+        if body.action != before["action"]:
+            # 対応の種類が変わったら、実施のチェックはやり直し
+            con.execute("UPDATE entries SET action_done_by=NULL, action_done_on=NULL WHERE id=?", (before["id"],))
         after = db.row_dict(con.execute("SELECT * FROM entries WHERE id=?", (before["id"],)).fetchone())
         db.record(con, user, "entry", before["id"], "対応", f"{ym} {item['code']} {item['name']} → {body.action}",
                   before, after)
+    return after
+
+
+class DoneIn(BaseModel):
+    done_on: str | None = None  # 実施した日。None=今日
+
+
+@app.put("/api/months/{ym}/items/{item_id}/action/done")
+def mark_done(ym: str, item_id: int, body: DoneIn, user: str = Depends(actor)):
+    """対応（製造計画に入れる・移動・廃棄など）を実施したとチェックする。"""
+    ym = check_ym(ym)
+    try:
+        day = date.fromisoformat(body.done_on) if body.done_on else date.today()
+    except ValueError:
+        raise HTTPException(400, "実施日の形式が不正です")
+    if day > date.today():
+        raise HTTPException(400, "実施日に未来の日付は入れられません")
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        if not before or not before["action"]:
+            raise HTTPException(400, "先に対応（予定）を記録してください")
+        con.execute("UPDATE entries SET action_done_by=?, action_done_on=? WHERE id=?",
+                    (user, day.isoformat(), before["id"]))
+        after = db.row_dict(con.execute("SELECT * FROM entries WHERE id=?", (before["id"],)).fetchone())
+        db.record(con, user, "entry", before["id"], "実施",
+                  f"{ym} {item['code']} {item['name']} {before['action']} 実施{day.isoformat()}", before, after)
+    return after
+
+
+@app.delete("/api/months/{ym}/items/{item_id}/action/done")
+def unmark_done(ym: str, item_id: int, user: str = Depends(actor)):
+    ym = check_ym(ym)
+    with db.connect() as con:
+        item = get_item(con, item_id)
+        before = db.row_dict(con.execute("SELECT * FROM entries WHERE ym=? AND item_id=?", (ym, item_id)).fetchone())
+        if not before or not before["action_done_by"]:
+            raise HTTPException(404, "実施のチェックがありません")
+        con.execute("UPDATE entries SET action_done_by=NULL, action_done_on=NULL WHERE id=?", (before["id"],))
+        after = db.row_dict(con.execute("SELECT * FROM entries WHERE id=?", (before["id"],)).fetchone())
+        db.record(con, user, "entry", before["id"], "実施取消",
+                  f"{ym} {item['code']} {item['name']} {before['action']}", before, after)
     return after
 
 
@@ -336,6 +450,16 @@ def alerts(ym: str):
     with db.connect() as con:
         rows = [r for r in month_items(con, ym) if r["status"] in ("warn", "expired")]
     rows.sort(key=lambda r: r["expiry_date"] or "")
+    return {"items": rows}
+
+
+@app.get("/api/months/{ym}/diffs")
+def diffs(ym: str):
+    """予想在庫との差異が大きい品目と、再棚卸待ちの品目。差の大きい順。"""
+    ym = check_ym(ym)
+    with db.connect() as con:
+        rows = [r for r in month_items(con, ym) if r["diff_alert"] or (not r["entry_id"] and r["recount_count"])]
+    rows.sort(key=lambda r: -abs((r["total_kg"] or 0) - (r["expected_kg"] or 0)) if r["entry_id"] else 0)
     return {"items": rows}
 
 
@@ -704,11 +828,14 @@ class CategoryIn(BaseModel):
     name: str
     locations: Literal["split", "single"] = "split"
     warn_months: int = Field(logic.WARN_MONTHS, ge=1, le=24)
+    diff_pct: float = Field(logic.DIFF_PCT, ge=0, le=100)
+    diff_kg: float = Field(logic.DIFF_KG, ge=0)
     sort: int = 0
     active: bool = True
 
 
 CATEGORY_LABEL = {"grp": "グループ", "name": "分類名", "locations": "置き場所", "warn_months": "判定の月数",
+                  "diff_pct": "差異の基準(%)", "diff_kg": "差異の基準(kg)",
                   "sort": "並び順", "active": "有効"}
 
 

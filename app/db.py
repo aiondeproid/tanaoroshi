@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS categories (
     name TEXT NOT NULL,
     locations TEXT NOT NULL DEFAULT 'split',  -- split=資材室と倉庫/パレット / single=1か所
     warn_months INTEGER NOT NULL DEFAULT 1,   -- 確認月の月末から何ヶ月あれば「レ」か
+    diff_pct REAL NOT NULL DEFAULT 0,         -- 予想在庫との差がこの割合(%)以上なら差異あり（0=割合では見ない）
+    diff_kg REAL NOT NULL DEFAULT 100,        -- かつ差がこの重さ(kg)以上なら差異あり
     sort INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1
 );
@@ -53,13 +55,15 @@ CREATE TABLE IF NOT EXISTS entries (
     case_weight REAL,                 -- 入力時点のケース重量
     pallet_cases REAL,                -- 入力時点の1パレットのケース数
     total_kg REAL NOT NULL DEFAULT 0,
-    expiry_kind TEXT NOT NULL DEFAULT '賞',  -- 賞/使/凍
+    expiry_kind TEXT NOT NULL DEFAULT '賞',  -- 賞/使/凍/製(製造日)
     expiry_date TEXT,
     mfg_date TEXT,
     status TEXT NOT NULL,
     action TEXT NOT NULL DEFAULT '',
     action_date TEXT,
     action_note TEXT NOT NULL DEFAULT '',
+    action_done_by TEXT,              -- 対応を実施したとチェックした人。NULL=未実施
+    action_done_on TEXT,              -- 実施した日
     counted_by TEXT NOT NULL,
     counted_at TEXT NOT NULL,         -- 保存した日時（自動）
     counted_on TEXT,                  -- 棚卸日。初期値は保存した日で、あとから直せる
@@ -74,6 +78,14 @@ CREATE TABLE IF NOT EXISTS expected (
     set_by TEXT NOT NULL,
     set_at TEXT NOT NULL,
     UNIQUE (ym, item_id)
+);
+CREATE TABLE IF NOT EXISTS recounts (
+    id INTEGER PRIMARY KEY,
+    ym TEXT NOT NULL,
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    entry_json TEXT NOT NULL,         -- 再棚卸にする前の入力（entries の1行そのまま）
+    requested_by TEXT NOT NULL,
+    requested_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS approvals (
     id INTEGER PRIMARY KEY,
@@ -107,6 +119,7 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS idx_history_at ON history(at);
 CREATE INDEX IF NOT EXISTS idx_entries_ym ON entries(ym);
 CREATE INDEX IF NOT EXISTS idx_item_docs_item ON item_docs(item_id);
+CREATE INDEX IF NOT EXISTS idx_recounts_ym_item ON recounts(ym, item_id);
 """
 
 
@@ -131,6 +144,10 @@ def init() -> None:
         for c in ("room_kg_parts", "wh_kg_parts"):
             if c not in cols:
                 con.execute(f"ALTER TABLE entries ADD COLUMN {c} TEXT")
+        # 対応の実施チェックの列がない古いDBには足す
+        for c in ("action_done_by", "action_done_on"):
+            if c not in cols:
+                con.execute(f"ALTER TABLE entries ADD COLUMN {c} TEXT")
         # パレットの列がない古いDBには足す
         if "wh_pallets" not in cols:
             con.execute("ALTER TABLE entries ADD COLUMN wh_pallets REAL NOT NULL DEFAULT 0")
@@ -142,6 +159,12 @@ def init() -> None:
         if "as_of" not in {r["name"] for r in con.execute("PRAGMA table_info(expected)")}:
             con.execute("ALTER TABLE expected ADD COLUMN as_of TEXT")
             con.execute("UPDATE expected SET as_of = substr(set_at, 1, 10)")
+        # 差異の基準の列がない古いDBには足す
+        cat_cols = {r["name"] for r in con.execute("PRAGMA table_info(categories)")}
+        if "diff_pct" not in cat_cols:
+            con.execute(f"ALTER TABLE categories ADD COLUMN diff_pct REAL NOT NULL DEFAULT {logic.DIFF_PCT}")
+        if "diff_kg" not in cat_cols:
+            con.execute(f"ALTER TABLE categories ADD COLUMN diff_kg REAL NOT NULL DEFAULT {logic.DIFF_KG}")
         # 判定の月数の列がない古いDBには足す。原料肉と野菜・チーズ・玉ねぎは2ヶ月
         if "warn_months" not in {r["name"] for r in con.execute("PRAGMA table_info(categories)")}:
             con.execute("ALTER TABLE categories ADD COLUMN warn_months INTEGER NOT NULL DEFAULT 1")
@@ -168,7 +191,8 @@ def rejudge(con, category_id: int, months: int, actor: str) -> None:
         if status in ("warn", "expired"):
             con.execute("UPDATE entries SET status=? WHERE id=?", (status, r["id"]))
         else:
-            con.execute("UPDATE entries SET status=?, action='', action_date=NULL, action_note='' WHERE id=?",
+            con.execute("UPDATE entries SET status=?, action='', action_date=NULL, action_note='',"
+                        " action_done_by=NULL, action_done_on=NULL WHERE id=?",
                         (status, r["id"]))
         after = row_dict(con.execute("SELECT * FROM entries WHERE id=?", (r["id"],)).fetchone())
         record(con, actor, "entry", r["id"], "再判定",

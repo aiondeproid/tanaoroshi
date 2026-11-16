@@ -5,6 +5,10 @@ from datetime import date
 # 確認月の月末から何ヶ月あればOKとするか（分類ごとに変えられる。これは初期値）
 WARN_MONTHS = 1
 
+# 予想在庫との差異の基準（分類ごとに変えられる。これは初期値）
+DIFF_PCT = 0    # 0=割合では判定しない
+DIFF_KG = 100
+
 STATUS_LABEL = {"ok": "レ", "warn": "×", "expired": "×", "none": ""}
 
 
@@ -42,6 +46,14 @@ def judge(expiry: date | None, ym: str, ref: date, months: int = WARN_MONTHS) ->
     if expiry <= ok_limit(ym, months):
         return "warn"
     return "ok"
+
+
+def diff_alert(total: float | None, expected: float | None, pct: float = DIFF_PCT, min_kg: float = DIFF_KG) -> bool:
+    """予想在庫との差が大きいか。差が予想の pct% 以上、かつ min_kg 以上なら True（差0は常に False）。"""
+    if total is None or expected is None:
+        return False
+    d = abs(round(total - expected, 3))
+    return d > 0 and d >= (min_kg or 0) and d >= round(expected * (pct or 0) / 100, 3)
 
 
 def total_kg(case_weight: float | None, cases: float, loose_kg: float) -> float:

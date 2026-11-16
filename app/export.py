@@ -47,6 +47,15 @@ def status_text(it) -> str:
     return STATUS_TEXT[it["status"]].format(it["warn_months"])
 
 
+def action_text(it) -> str:
+    """分類のシートの「対応」欄。実施済みなら実施日と確認者も書く。"""
+    if not it["action"]:
+        return ""
+    if it["action_done_by"]:
+        return f"{it['action']}\n(実施済 {jdate(it['action_done_on'])} {it['action_done_by']})"
+    return f"{it['action']}\n(未実施)"
+
+
 def rule_text(ym: str, months: int) -> str:
     me, limit = logic.month_end(ym), logic.ok_limit(ym, months)
     return (f"賞味期限管理：確認月の月末（{me.month}/{me.day}）から{months}ヶ月"
@@ -82,21 +91,23 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
     for i, (months, names) in enumerate(sorted(by_months.items())):
         cell(ws, 2 + i, 1, rule_text(ym, months) + ("" if len(by_months) == 1 else f"（{'・'.join(names)}）"))
     top = 3 + len(by_months)
-    heads = ["分類", "コード", "品名", "総重量(kg)", "区分", "期限", "判定", "対応", "対応予定日", "対応メモ", "担当者", "棚卸日"]
+    heads = ["分類", "コード", "品名", "総重量(kg)", "区分", "期限", "判定", "対応", "対応予定日", "対応メモ",
+             "実施日", "実施確認", "担当者", "棚卸日"]
     for i, h in enumerate(heads, 1):
         cell(ws, top, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
     r = first = top + 1
     for it in sorted((x for x in rows if x["status"] in ("warn", "expired")), key=lambda x: x["expiry_date"] or ""):
         vals = [it["category_name"], it["code"], it["name"], it["total_kg"], it["expiry_kind"],
                 jdate(it["expiry_date"]), status_text(it), it["action"], jdate(it["action_date"]),
-                it["action_note"], it["counted_by"], jdate(it["counted_on"])]
+                it["action_note"], jdate(it["action_done_on"]), it["action_done_by"] or ("未実施" if it["action"] else ""),
+                it["counted_by"], jdate(it["counted_on"])]
         fill = EXPIRED_FILL if it["status"] == "expired" else WARN_FILL
         for i, v in enumerate(vals, 1):
             cell(ws, r, i, v, border=BORDER, alignment=WRAP, fill=fill)
         r += 1
     if r == first:
         cell(ws, r, 1, "警告はありません")
-    for i, w in enumerate([16, 10, 32, 11, 6, 12, 15, 16, 12, 28, 10, 11], 1):
+    for i, w in enumerate([16, 10, 32, 11, 6, 12, 15, 16, 12, 28, 11, 10, 10, 11], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
@@ -146,11 +157,12 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
             expiry = jdate(it["expiry_date"]) or (("在庫ゼロ" if not it["total_kg"] else MODE_NOTE.get(it["expiry_mode"], ""))
                                                   if entered else "")
             if it["mfg_date"]:
-                expiry += f"\n(製造日{jdate(it['mfg_date'])})"
+                mfg = f"製造日{jdate(it['mfg_date'])}"
+                expiry = f"{expiry}\n({mfg})" if expiry else mfg
             name = it["name"] + ("（終売）" if not it["active"] else "")
             vals = [it["code"], name, it["storage"], it["entry_case_weight"] if entered else it["case_weight"], *loc,
                     it["total_kg"] if entered else None, it["expiry_kind"] if entered else "", expiry,
-                    status_text(it) if entered else "未入力", it["action"] or "", it["action_note"] or "",
+                    status_text(it) if entered else "未入力", action_text(it), it["action_note"] or "",
                     it["counted_by"] or "", jdate(it["counted_on"])]
             fill = {"warn": WARN_FILL, "expired": EXPIRED_FILL}.get(it["status"]) if entered else None
             for i, v in enumerate(vals, 1):

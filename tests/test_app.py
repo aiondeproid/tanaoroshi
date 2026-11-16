@@ -117,6 +117,103 @@ def test_zero_stock_needs_no_expiry(client):
         assert e["total_kg"] == 0 and e["status"] == "ok" and e["expiry_date"] is None
 
 
+def test_mfg_kind_records_mfg_date_without_judging(client):
+    it = items(client, "2026-06")["04084"]  # 期限を入力する品目
+    url = f"/api/months/2026-06/items/{it['id']}"
+    # 製造日を選んだら製造日が必要
+    assert client.put(url, headers=USER, json={"room_cases": 1, "expiry_kind": "製"}).status_code == 400
+    # 期限が過去でも判定しない（期限は残さない）
+    r = client.put(url, headers=USER, json={"room_cases": 1, "expiry_kind": "製", "mfg_date": "2025-01-10",
+                                            "expiry_date": "2025-02-01"})
+    assert r.status_code == 200, r.text
+    e = r.json()
+    assert e["status"] == "ok" and e["expiry_date"] is None and e["mfg_date"] == "2025-01-10" and e["expiry_kind"] == "製"
+    # 賞味期限に戻したら製造日は残さない
+    far = "2030-01-01"
+    e = client.put(url, headers=USER, json={"room_cases": 1, "expiry_kind": "賞", "expiry_date": far,
+                                            "mfg_date": "2025-01-10"}).json()
+    assert e["mfg_date"] is None and e["expiry_date"] == far
+
+
+def test_recount_keeps_previous_entry(client):
+    ym = "2026-05"
+    it = items(client, ym)["04084"]
+    url = f"/api/months/{ym}/items/{it['id']}"
+    far = logic.add_months(date.today(), 3).isoformat()
+    # 入力がないと再棚卸にできない
+    assert client.post(url + "/recount", headers=USER).status_code == 404
+    client.put(url, headers=USER, json={"room_cases": 2, "room_kg": 1, "expiry_date": far})
+    r = client.post(url + "/recount", headers=USER)
+    assert r.status_code == 200 and r.json()["recount_count"] == 1
+    # 未入力に戻り、前回の入力が見える
+    it = items(client, ym)["04084"]
+    assert it["entry_id"] is None and it["recount_count"] == 1
+    assert json.loads(it["prev_entry"])["total_kg"] == 15
+    # 取消すと前回の入力に戻る
+    assert client.delete(url + "/recount", headers=USER).json()["total_kg"] == 15
+    it = items(client, ym)["04084"]
+    assert it["total_kg"] == 15 and it["recount_count"] == 0 and it["prev_entry"] is None
+    assert client.delete(url + "/recount", headers=USER).status_code == 404
+    # 数え直して入力したら、前回分は残ったまま。数え直した入力がある間は取消せない
+    client.post(url + "/recount", headers=USER)
+    client.put(url, headers=USER, json={"room_cases": 3, "expiry_date": far})
+    it = items(client, ym)["04084"]
+    assert it["total_kg"] == 21 and it["recount_count"] == 1 and json.loads(it["prev_entry"])["total_kg"] == 15
+    assert client.delete(url + "/recount", headers=USER).status_code == 409
+    # 2回目の再棚卸では、直前（2回目の数え直し前）の入力が前回になる
+    client.post(url + "/recount", headers=USER)
+    it = items(client, ym)["04084"]
+    assert it["recount_count"] == 2 and json.loads(it["prev_entry"])["total_kg"] == 21
+    hist = client.get("/api/admin/history", params={"entity": "entry", "q": "2026-05 04084"}, headers=ADMIN).json()
+    assert [h["action"] for h in hist[:3]] == ["再棚卸", "入力", "再棚卸"]
+
+
+def test_diff_alert_rule():
+    assert not logic.diff_alert(None, 100) and not logic.diff_alert(100, None)
+    assert not logic.diff_alert(100, 100)
+    assert logic.diff_alert(300, 200) and not logic.diff_alert(299.9, 200)  # 初期値は100kg以上
+    assert logic.diff_alert(110, 100, 10, 0)          # ちょうど10%は差異あり
+    assert not logic.diff_alert(109.9, 100, 10, 0)
+    assert logic.diff_alert(90, 100, 10, 0)           # 少ない方も
+    assert not logic.diff_alert(3, 2, 10, 2)          # 50%でも1kgの差は無視
+    assert logic.diff_alert(5, 0, 10, 0)              # 予想0で在庫あり
+
+
+def test_diffs_list_and_summary(client):
+    ym = "2026-04"
+    it = items(client, ym)["04084"]
+    url = f"/api/months/{ym}/items/{it['id']}"
+    far = logic.add_months(date.today(), 3).isoformat()
+    client.put(url + "/expected", headers=USER, json={"kg": 70})
+    client.put(url, headers=USER, json={"room_cases": 10, "expiry_date": far})  # 70kg 差0
+    assert client.get(f"/api/months/{ym}/diffs").json()["items"] == []
+    client.put(url, headers=USER, json={"room_cases": 10, "room_kg": 99.9, "expiry_date": far})  # 差99.9kg
+    assert client.get(f"/api/months/{ym}/diffs").json()["items"] == []
+    client.put(url, headers=USER, json={"room_cases": 10, "room_kg": 100, "expiry_date": far})  # ちょうど100kg
+    d = client.get(f"/api/months/{ym}/diffs").json()["items"]
+    assert [x["code"] for x in d] == ["04084"] and d[0]["diff_alert"]
+    s = client.get(f"/api/months/{ym}/summary").json()["categories"][str(it["category_id"])]
+    assert s["diff"] == 1 and s["recount"] == 0
+    # 再棚卸にすると差異ではなく再棚卸待ちとして数える
+    client.post(url + "/recount", headers=USER)
+    d = client.get(f"/api/months/{ym}/diffs").json()["items"]
+    assert len(d) == 1 and d[0]["entry_id"] is None
+    s = client.get(f"/api/months/{ym}/summary").json()["categories"][str(it["category_id"])]
+    assert s["diff"] == 0 and s["recount"] == 1
+    # 数え直して差が消えれば一覧から消える
+    client.put(url, headers=USER, json={"room_cases": 10, "expiry_date": far})
+    assert client.get(f"/api/months/{ym}/diffs").json()["items"] == []
+    # 分類の基準を変えると判定が変わる
+    client.put(url, headers=USER, json={"room_cases": 11, "expiry_date": far})  # 差7kg
+    assert client.get(f"/api/months/{ym}/diffs").json()["items"] == []
+    cat = next(c for c in client.get("/api/admin/categories", headers=ADMIN).json() if c["id"] == it["category_id"])
+    assert cat["diff_pct"] == 0 and cat["diff_kg"] == 100
+    body = {k: cat[k] for k in ("grp", "name", "locations", "warn_months", "sort")} | {"active": True, "diff_kg": 5}
+    assert client.put(f"/api/admin/categories/{cat['id']}", headers=ADMIN, json=body).status_code == 200
+    assert len(client.get(f"/api/months/{ym}/diffs").json()["items"]) == 1
+    client.put(f"/api/admin/categories/{cat['id']}", headers=ADMIN, json=body | {"diff_kg": 100})
+
+
 def test_pallets_count_as_cases(client):
     it = items(client, "2026-07")["04084"]
     far = logic.add_months(date.today(), 3).isoformat()
@@ -150,6 +247,45 @@ def test_expired_entry_shows_in_alerts_and_action(client):
     assert alerts[0]["action"] == "廃棄"
     r = client.put(f"/api/months/{ym}/items/{it['id']}/action", headers=USER, json={"action": "移動", "action_note": "A倉庫"})
     assert r.json()["action"] == "移動"
+
+
+def test_action_done_check(client):
+    ym = "2026-03"
+    it = items(client, ym)["04084"]
+    url = f"/api/months/{ym}/items/{it['id']}"
+    past = date(2020, 1, 1).isoformat()
+    cat = str(it["category_id"])
+    client.put(url, headers=USER, json={"room_cases": 1, "expiry_date": past})
+    # 予定が無いと実施にできない
+    assert client.put(url + "/action/done", headers=USER, json={}).status_code == 400
+    client.put(url + "/action", headers=USER, json={"action": "廃棄", "action_date": "2026-03-20"})
+    s = client.get(f"/api/months/{ym}/summary").json()["categories"][cat]
+    assert s["todo"] == 0 and s["undone"] == 1
+    future = logic.add_months(date.today(), 1).isoformat()
+    assert client.put(url + "/action/done", headers=USER, json={"done_on": future}).status_code == 400
+    r = client.put(url + "/action/done", headers=USER, json={"done_on": "2026-03-21"})
+    assert r.status_code == 200 and r.json()["action_done_by"] == "田中" and r.json()["action_done_on"] == "2026-03-21"
+    assert client.get(f"/api/months/{ym}/summary").json()["categories"][cat]["undone"] == 0
+    a = client.get(f"/api/months/{ym}/alerts").json()["items"][0]
+    assert a["action_done_by"] == "田中"
+    # メモを変えても、入力を保存し直しても実施は残る
+    client.put(url + "/action", headers=USER, json={"action": "廃棄", "action_date": "2026-03-20", "action_note": "済"})
+    e = client.put(url, headers=USER, json={"room_cases": 2, "expiry_date": past, "action": "廃棄"}).json()
+    assert e["action_done_by"] == "田中"
+    # 対応の種類が変わったら実施はやり直し
+    e = client.put(url + "/action", headers=USER, json={"action": "移動"}).json()
+    assert e["action_done_by"] is None and e["action_done_on"] is None
+    # 取消
+    client.put(url + "/action/done", headers=USER, json={})
+    assert client.delete(url + "/action/done", headers=USER).json()["action_done_by"] is None
+    assert client.delete(url + "/action/done", headers=USER).status_code == 404
+    # Excel にも出る
+    client.put(url + "/action/done", headers=USER, json={"done_on": "2026-03-22"})
+    wb = openpyxl.load_workbook(io.BytesIO(client.get(f"/api/months/{ym}/export.xlsx").content))
+    ws = wb["期限警告一覧"]
+    heads = [c.value for c in ws[4]]
+    assert ws.cell(row=5, column=heads.index("実施確認") + 1).value == "田中"
+    assert ws.cell(row=5, column=heads.index("実施日") + 1).value == "2026/3/22"
 
 
 def test_counted_on_can_be_corrected(client):
