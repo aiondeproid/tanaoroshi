@@ -451,6 +451,33 @@ def test_export_xlsx(client):
     assert ws.cell(row=row, column=col).value == f"{today.year}/{today.month}/{today.day}"
 
 
+def test_month_items_for_search(client):
+    """トップ画面の検索用に、全分類の品目をまとめて返す。"""
+    items = client.get("/api/months/2026-09/items").json()["items"]
+    codes = {it["code"] for it in items}
+    assert {"04084", "01009"} <= codes
+    assert all("category_name" in it and "name" in it for it in items)
+    assert client.get("/api/months/2026-13/items").status_code in (400, 422)
+
+
+def test_export_xlsx_code_order(client):
+    """コード順を選ぶと、全分類の品目をコード順に1シートにまとめる。"""
+    r = client.get("/api/months/2026-09/export.xlsx?order=code")
+    assert r.status_code == 200
+    assert "%E3%82%B3%E3%83%BC%E3%83%89%E9%A0%86" in r.headers["content-disposition"]
+    wb = openpyxl.load_workbook(io.BytesIO(r.content))
+    assert wb.sheetnames == ["期限警告一覧", "全品目（コード順）"]
+    ws = wb["全品目（コード順）"]
+    assert ws.cell(row=5, column=1).value == "分類"
+    assert ws.cell(row=5, column=2).value == "コード"
+    codes = [ws.cell(row=r, column=2).value for r in range(7, ws.max_row + 1)]
+    assert codes == sorted(codes)
+    assert "04084" in codes and "01009" in codes
+    # 既定は分類ごと
+    wb = openpyxl.load_workbook(io.BytesIO(client.get("/api/months/2026-09/export.xlsx?order=xxx").content))
+    assert "全品目（コード順）" not in wb.sheetnames
+
+
 def test_items_excel_round_trip(client):
     assert client.get("/api/admin/items.xlsx", headers=USER).status_code == 403
     r = client.get("/api/admin/items.xlsx", headers=ADMIN)

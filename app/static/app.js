@@ -235,9 +235,12 @@ async function renderHome() {
     g.cats.push(c);
   });
   const [y, m] = state.ym.split("-").map(Number);
+  homeView.items = null; // 入力で中身が変わるので、描き直すたびに取り直す
   view.innerHTML = `
     <h1>${y}年${m}月の棚卸</h1>
     ${ruleLines(cats)}
+    <input class="search" id="hq" type="search" placeholder="コード・品名で探す（全分類）" value="${esc(homeView.q)}">
+    <div id="hits"></div>
     ${!(warn + expired)
       ? `<a class="banner ok" href="#/alerts">期限警告はありません</a>`
       : todo + undone
@@ -252,9 +255,50 @@ async function renderHome() {
       <div class="grid">${g.cats.map((c) => catCard(c, s.categories[c.id])).join("")}</div>`).join("")}
     <h2>出力・管理</h2>
     <div class="row">
-      <a class="btn primary" href="/api/months/${state.ym}/export.xlsx" style="text-decoration:none;display:inline-flex;align-items:center">Excelで出力</a>
+      <a class="btn primary" href="/api/months/${state.ym}/export.xlsx" style="text-decoration:none;display:inline-flex;align-items:center">Excelで出力（分類ごと）</a>
+      <a class="btn" href="/api/months/${state.ym}/export.xlsx?order=code" style="text-decoration:none;display:inline-flex;align-items:center">Excelで出力（コード順にまとめる）</a>
       <a class="btn" href="#/admin" style="text-decoration:none;display:inline-flex;align-items:center">管理画面</a>
     </div>`;
+  $("#hq").addEventListener("input", (e) => { homeView.q = e.target.value; drawHits(); });
+  drawHits();
+}
+
+// ---------- トップの品目検索 ----------
+const homeView = { q: "", items: null, ym: null };
+const HIT_MAX = 50;
+// 全角の英数字やカナの揺れを吸収して比べる
+const normQ = (s) => String(s ?? "").normalize("NFKC").toLowerCase();
+
+async function drawHits() {
+  const box = $("#hits");
+  if (!box) return;
+  const q = normQ(homeView.q).trim();
+  if (!q) { box.innerHTML = ""; return; }
+  if (!homeView.items || homeView.ym !== state.ym) {
+    box.innerHTML = `<p class="muted">読み込み中…</p>`;
+    try {
+      const ym = state.ym;
+      const d = await api("GET", `/api/months/${ym}/items`);
+      const catIds = new Set(state.meta.categories.map((c) => c.id));
+      homeView.items = d.items.filter((it) => catIds.has(it.category_id));
+      homeView.ym = ym;
+    } catch (e) { box.innerHTML = `<p class="notice">${esc(e.message)}</p>`; return; }
+    if (!$("#hits")) return; // 読み込み中に別の画面へ移った
+    if (normQ(homeView.q).trim() !== q) return drawHits(); // 読み込み中に検索語が変わった
+  }
+  const hits = homeView.items.filter((it) => normQ(it.code).includes(q) || normQ(it.name).includes(q));
+  box.innerHTML = `<div class="list hits">${hits.length ? hits.slice(0, HIT_MAX).map((it) => `
+      <button class="item${it.active ? "" : " inactive"}" data-id="${it.id}">
+        <span class="main"><span class="code">${esc(it.code)}・${esc(it.storage)}・${esc(it.category_name)}</span><br><span class="name">${esc(it.name)}</span></span>
+        <span class="side">${it.diff_alert ? `<span class="pill diff">差異大</span> ` : ""}${it.entry_id ? `<span class="pill s-${it.status}">${statusLabel(it)}</span><br>${fmtKg(it.total_kg)}`
+          : it.recount_count ? `<span class="pill recount">再棚卸待ち</span>` : `<span class="pill s-none">未入力</span>`}</span>
+      </button>`).join("") : `<p class="muted" style="padding:14px">該当する品目はありません</p>`}</div>
+    ${hits.length > HIT_MAX ? `<p class="muted">${hits.length}件中 ${HIT_MAX}件を表示しています。もう少し絞り込んでください</p>` : ""}`;
+  box.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
+    const it = homeView.items.find((x) => x.id === Number(b.dataset.id));
+    const cat = state.meta.categories.find((c) => c.id === it.category_id);
+    openEntry(it, cat, () => renderHome());
+  }));
 }
 
 // 判定基準。分類で月数が違うときは月数ごとに1行

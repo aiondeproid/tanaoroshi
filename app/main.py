@@ -163,6 +163,14 @@ def summary(ym: str):
     }
 
 
+@app.get("/api/months/{ym}/items")
+def all_items(ym: str):
+    """その月に数える全分類の品目（トップ画面の検索用）。"""
+    ym = check_ym(ym)
+    with db.connect() as con:
+        return {"items": month_items(con, ym)}
+
+
 @app.get("/api/months/{ym}/categories/{category_id}")
 def category_detail(ym: str, category_id: int):
     ym = check_ym(ym)
@@ -505,11 +513,13 @@ def unapprove(ym: str, category_id: int, role: str, user: str = Depends(actor)):
 # ---------- Excel出力 ----------
 
 @app.get("/api/months/{ym}/export.xlsx")
-def export_xlsx(ym: str):
+def export_xlsx(ym: str, order: str = "category"):
+    """order=code なら全品目をコード順に1シートにまとめる（既定は分類ごとのシート）。"""
     ym = check_ym(ym)
+    order = "code" if order == "code" else "category"
     with db.connect() as con:
-        data = export.build(con, ym, month_items, ROLES)
-    name = f"原料棚卸_{ym}.xlsx"
+        data = export.build(con, ym, month_items, ROLES, order)
+    name = f"原料棚卸_{ym}{'_コード順' if order == 'code' else ''}.xlsx"
     return Response(
         data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},

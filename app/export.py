@@ -69,7 +69,89 @@ def cell(ws, r, c, v, **style):
     return x
 
 
-def build(con, ym: str, month_items, roles: list[str]) -> bytes:
+def item_sheet(ws, ym: str, title: str, items, split: bool, with_cat: bool = False,
+               warn_months: int | None = None, approvals=()):
+    """品目の一覧シート。with_cat=True なら先頭に分類の列を足す（コード順でまとめるとき）。"""
+    y, m = map(int, ym.split("-"))
+    off = 1 if with_cat else 0
+    cell(ws, 1, 1, f"在庫賞味期限管理（{title}）", font=Font(size=14, bold=True))
+    cell(ws, 2, 1, f"棚卸月：{y}年{m}月　　棚卸日：{counted_range(items)}　　出力日：{date.today():%Y/%m/%d}")
+    if warn_months is not None:
+        cell(ws, 3, 1, rule_text(ym, warn_months))
+    else:
+        months = sorted({x["warn_months"] for x in items})
+        cell(ws, 3, 1, "　".join(rule_text(ym, k) for k in months) if len(months) == 1
+             else "賞味期限管理：分類ごとの月数で判定（判定の欄を参照）")
+
+    # 確認欄（右上）
+    start = (13 if split else 10) + off
+    for i, (role, a) in enumerate(approvals):
+        cell(ws, 1, start + i, role, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
+        txt = f"{a['staff_name']}\n{a['at'][:10]}" + (f"\n{a['detail']}" if a and a["detail"] else "") if a else ""
+        cell(ws, 2, start + i, txt, border=BORDER, alignment=CENTER)
+    if approvals:
+        ws.row_dimensions[2].height = 45
+
+    loc_heads = (["資材室", "", "倉庫/パレット", "", ""] if split else ["在庫", ""])
+    heads = [*(["分類"] if with_cat else []), "コード", "品名", "保管", "ケース重量(kg)", *loc_heads, "総重量(kg)", "区分",
+             "賞味期限/使用期限", "チェック(レ・×)", "対応", "対応メモ", "担当者", "棚卸日"]
+    loc_sub = ["ケース", "端数kg", "パレット", "ケース", "端数kg"] if split else ["ケース", "端数kg"]
+    sub = [*([""] if with_cat else []), "", "", "", "", *loc_sub, "", "", "", "", "", "", "", ""]
+    for i, (h, s) in enumerate(zip(heads, sub), 1):
+        cell(ws, 5, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
+        cell(ws, 6, i, s, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
+    ws.merge_cells(start_row=5, start_column=5 + off, end_row=5, end_column=6 + off)
+    if split:
+        ws.merge_cells(start_row=5, start_column=7 + off, end_row=5, end_column=9 + off)
+    for i, h in enumerate(heads, 1):
+        if h and not sub[i - 1]:
+            ws.merge_cells(start_row=5, start_column=i, end_row=6, end_column=i)
+
+    wrap_cols = {2 + off, (15 if split else 12) + off}
+    r = 7
+    for it in items:
+        entered = it["entry_id"] is not None
+        if not entered:
+            loc = [None] * len(loc_sub)
+        elif split and it["locations"] != "split":
+            # まとめたシートで保管場所を分けない分類は「資材室」の欄に書く
+            loc = [it["room_cases"], it["room_kg"], None, None, None]
+        elif split:
+            loc = [it["room_cases"], it["room_kg"], it["wh_pallets"], it["wh_cases"], it["wh_kg"]]
+        else:
+            loc = [it["room_cases"], it["room_kg"]]
+        expiry = jdate(it["expiry_date"]) or (("在庫ゼロ" if not it["total_kg"] else MODE_NOTE.get(it["expiry_mode"], ""))
+                                              if entered else "")
+        if it["mfg_date"]:
+            mfg = f"製造日{jdate(it['mfg_date'])}"
+            expiry = f"{expiry}\n({mfg})" if expiry else mfg
+        name = it["name"] + ("（終売）" if not it["active"] else "")
+        vals = [*([it["category_name"]] if with_cat else []),
+                it["code"], name, it["storage"], it["entry_case_weight"] if entered else it["case_weight"], *loc,
+                it["total_kg"] if entered else None, it["expiry_kind"] if entered else "", expiry,
+                status_text(it) if entered else "未入力", action_text(it), it["action_note"] or "",
+                it["counted_by"] or "", jdate(it["counted_on"])]
+        fill = {"warn": WARN_FILL, "expired": EXPIRED_FILL}.get(it["status"]) if entered else None
+        for i, v in enumerate(vals, 1):
+            x = cell(ws, r, i, v, border=BORDER, alignment=WRAP if i in wrap_cols else CENTER)
+            if fill:
+                x.fill = fill
+        r += 1
+
+    widths = [*([14] if with_cat else []), 10, 30, 6, 9, *([7, 8, 7, 7, 8] if split else [7, 8]),
+              10, 5, 13, 11, 14, 22, 9, 11]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = ws.cell(row=7, column=3 + off).coordinate
+    ws.print_title_rows = "5:6"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def build(con, ym: str, month_items, roles: list[str], order: str = "category") -> bytes:
+    """order="category"：分類ごとのシート、"code"：全品目をコード順に1シートにまとめる。"""
     y, m = map(int, ym.split("-"))
     rows = month_items(con, ym)
     cats = [dict(r) for r in con.execute("SELECT * FROM categories WHERE active=1 ORDER BY sort")]
@@ -114,72 +196,20 @@ def build(con, ym: str, month_items, roles: list[str]) -> bytes:
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # 分類ごとのシート
-    for cat in cats:
-        items = [x for x in rows if x["category_id"] == cat["id"]]
-        if not items:
-            continue
-        split = cat["locations"] == "split"
-        ws = wb.create_sheet(safe_title(cat["name"], used))
-        cell(ws, 1, 1, f"在庫賞味期限管理（{cat['name']}）", font=Font(size=14, bold=True))
-        cell(ws, 2, 1, f"棚卸月：{y}年{m}月　　棚卸日：{counted_range(items)}　　出力日：{date.today():%Y/%m/%d}")
-        cell(ws, 3, 1, rule_text(ym, cat["warn_months"]))
-
-        # 確認欄（右上）
-        start = 13 if split else 10
-        for i, role in enumerate(roles):
-            a = appr.get((cat["id"], role))
-            cell(ws, 1, start + i, role, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
-            txt = f"{a['staff_name']}\n{a['at'][:10]}" + (f"\n{a['detail']}" if a and a["detail"] else "") if a else ""
-            cell(ws, 2, start + i, txt, border=BORDER, alignment=CENTER)
-        ws.row_dimensions[2].height = 45
-
-        loc_heads = (["資材室", "", "倉庫/パレット", "", ""] if split else ["在庫", ""])
-        heads = ["コード", "品名", "保管", "ケース重量(kg)", *loc_heads, "総重量(kg)", "区分",
-                 "賞味期限/使用期限", "チェック(レ・×)", "対応", "対応メモ", "担当者", "棚卸日"]
-        loc_sub = ["ケース", "端数kg", "パレット", "ケース", "端数kg"] if split else ["ケース", "端数kg"]
-        sub = ["", "", "", "", *loc_sub, "", "", "", "", "", "", "", ""]
-        for i, (h, s) in enumerate(zip(heads, sub), 1):
-            cell(ws, 5, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
-            cell(ws, 6, i, s, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
-        ws.merge_cells(start_row=5, start_column=5, end_row=5, end_column=6)
-        if split:
-            ws.merge_cells(start_row=5, start_column=7, end_row=5, end_column=9)
-        for i, h in enumerate(heads, 1):
-            if h and not sub[i - 1]:
-                ws.merge_cells(start_row=5, start_column=i, end_row=6, end_column=i)
-
-        r = 7
-        for it in items:
-            entered = it["entry_id"] is not None
-            loc = ([it["room_cases"], it["room_kg"], it["wh_pallets"], it["wh_cases"], it["wh_kg"]] if split
-                   else [it["room_cases"], it["room_kg"]]) if entered else [None] * len(loc_sub)
-            expiry = jdate(it["expiry_date"]) or (("在庫ゼロ" if not it["total_kg"] else MODE_NOTE.get(it["expiry_mode"], ""))
-                                                  if entered else "")
-            if it["mfg_date"]:
-                mfg = f"製造日{jdate(it['mfg_date'])}"
-                expiry = f"{expiry}\n({mfg})" if expiry else mfg
-            name = it["name"] + ("（終売）" if not it["active"] else "")
-            vals = [it["code"], name, it["storage"], it["entry_case_weight"] if entered else it["case_weight"], *loc,
-                    it["total_kg"] if entered else None, it["expiry_kind"] if entered else "", expiry,
-                    status_text(it) if entered else "未入力", action_text(it), it["action_note"] or "",
-                    it["counted_by"] or "", jdate(it["counted_on"])]
-            fill = {"warn": WARN_FILL, "expired": EXPIRED_FILL}.get(it["status"]) if entered else None
-            for i, v in enumerate(vals, 1):
-                x = cell(ws, r, i, v, border=BORDER, alignment=WRAP if i in (2, 15 if split else 12) else CENTER)
-                if fill:
-                    x.fill = fill
-            r += 1
-
-        widths = [10, 30, 6, 9, *([7, 8, 7, 7, 8] if split else [7, 8]), 10, 5, 13, 11, 14, 22, 9, 11]
-        for i, w in enumerate(widths, 1):
-            ws.column_dimensions[get_column_letter(i)].width = w
-        ws.freeze_panes = "C7"
-        ws.print_title_rows = "5:6"
-        ws.page_setup.orientation = "landscape"
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
+    if order == "code":
+        # 全分類をコード順に1枚にまとめる（分類の列を足し、保管場所は分けて書ける形にそろえる）
+        items = sorted(rows, key=lambda x: (x["code"], x["category_name"]))
+        if items:
+            ws = wb.create_sheet(safe_title("全品目（コード順）", used))
+            item_sheet(ws, ym, "全品目・コード順", items, split=True, with_cat=True)
+    else:
+        for cat in cats:
+            items = [x for x in rows if x["category_id"] == cat["id"]]
+            if not items:
+                continue
+            ws = wb.create_sheet(safe_title(cat["name"], used))
+            item_sheet(ws, ym, cat["name"], items, split=cat["locations"] == "split", warn_months=cat["warn_months"],
+                       approvals=[(role, appr.get((cat["id"], role))) for role in roles])
 
     buf = io.BytesIO()
     wb.save(buf)

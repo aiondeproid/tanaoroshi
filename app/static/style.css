@@ -99,6 +99,9 @@ a.card { display: block; color: inherit; text-decoration: none; }
 .chip { border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 6px 14px; min-height: 40px; }
 .chip.on { background: var(--main); border-color: var(--main); color: var(--main-ink); }
 
+#hq { margin: 6px 0 4px; }
+#hits { margin-bottom: 12px; }
+.hits { margin-top: 6px; max-height: 60vh; overflow-y: auto; }
 .list { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .item { display: flex; gap: 10px; align-items: center; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 12px 14px; min-height: 64px; }
 .item:last-child { border-bottom: 0; }
