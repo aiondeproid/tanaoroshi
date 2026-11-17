@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS approvals (
     at TEXT NOT NULL,
     UNIQUE (ym, category_id, role)
 );
+-- 期限警告一覧の確認（分類に関係なく月ごとに1つ）。detail に確認したときの件数を残す
+CREATE TABLE IF NOT EXISTS alert_approvals (
+    id INTEGER PRIMARY KEY,
+    ym TEXT NOT NULL,
+    role TEXT NOT NULL,
+    staff_name TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    UNIQUE (ym, role)
+);
 CREATE TABLE IF NOT EXISTS item_docs (
     id INTEGER PRIMARY KEY,
     item_id INTEGER NOT NULL REFERENCES items(id),

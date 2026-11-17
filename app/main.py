@@ -457,8 +457,9 @@ def alerts(ym: str):
     ym = check_ym(ym)
     with db.connect() as con:
         rows = [r for r in month_items(con, ym) if r["status"] in ("warn", "expired")]
+        appr = {r["role"]: dict(r) for r in con.execute("SELECT * FROM alert_approvals WHERE ym=?", (ym,))}
     rows.sort(key=lambda r: r["expiry_date"] or "")
-    return {"items": rows}
+    return {"items": rows, "approvals": appr}
 
 
 @app.get("/api/months/{ym}/diffs")
@@ -507,6 +508,42 @@ def unapprove(ym: str, category_id: int, role: str, user: str = Depends(actor)):
         con.execute("DELETE FROM approvals WHERE id=?", (before["id"],))
         db.record(con, user, "approval", category_id, "確認取消", f"{ym} {category_name(con, category_id)} {role}",
                   before, None)
+    return {"ok": True}
+
+
+def alert_counts(rows) -> str:
+    """期限警告一覧の確認に残す件数（警告・未対応・未実施）。"""
+    al = [r for r in rows if r["status"] in ("warn", "expired")]
+    todo = sum(1 for r in al if not r["action"])
+    undone = sum(1 for r in al if r["action"] and not r["action_done_by"])
+    return f"警告{len(al)}件 未対応{todo} 未実施{undone}"
+
+
+@app.post("/api/months/{ym}/alerts/approvals")
+def approve_alerts(ym: str, body: ApprovalIn, user: str = Depends(actor)):
+    ym = check_ym(ym)
+    if body.role not in ROLES:
+        raise HTTPException(400, "確認区分が不正です")
+    with db.connect() as con:
+        detail = alert_counts(month_items(con, ym))
+        try:
+            con.execute("INSERT INTO alert_approvals (ym, role, staff_name, detail, at) VALUES (?,?,?,?,?)",
+                        (ym, body.role, user, detail, db.now()))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "すでに確認済みです")
+        db.record(con, user, "alert_approval", None, "確認", f"{ym} 期限警告一覧 {body.role} {detail}")
+    return {"ok": True}
+
+
+@app.delete("/api/months/{ym}/alerts/approvals/{role}")
+def unapprove_alerts(ym: str, role: str, user: str = Depends(actor)):
+    ym = check_ym(ym)
+    with db.connect() as con:
+        before = db.row_dict(con.execute("SELECT * FROM alert_approvals WHERE ym=? AND role=?", (ym, role)).fetchone())
+        if not before:
+            raise HTTPException(404, "確認がありません")
+        con.execute("DELETE FROM alert_approvals WHERE id=?", (before["id"],))
+        db.record(con, user, "alert_approval", None, "確認取消", f"{ym} 期限警告一覧 {role}", before, None)
     return {"ok": True}
 
 

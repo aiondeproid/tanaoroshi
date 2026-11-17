@@ -170,6 +170,13 @@ def build(con, ym: str, month_items, roles: list[str], order: str = "category") 
     by_months: dict[int, list[str]] = {}
     for c in cats:
         by_months.setdefault(c["warn_months"], []).append(c["name"])
+    # 確認欄（右上）
+    alert_appr = {a["role"]: a for a in con.execute("SELECT * FROM alert_approvals WHERE ym=?", (ym,))}
+    for i, role in enumerate(roles):
+        a = alert_appr.get(role)
+        cell(ws, 1, 11 + i, role, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
+        cell(ws, 2, 11 + i, f"{a['staff_name']}\n{a['at'][:10]}\n{a['detail']}" if a else "", border=BORDER, alignment=CENTER)
+    ws.row_dimensions[2].height = 45
     for i, (months, names) in enumerate(sorted(by_months.items())):
         cell(ws, 2 + i, 1, rule_text(ym, months) + ("" if len(by_months) == 1 else f"（{'・'.join(names)}）"))
     top = 3 + len(by_months)

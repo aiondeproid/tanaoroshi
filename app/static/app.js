@@ -377,15 +377,7 @@ async function renderCategory(id) {
     </div>
     <div class="list" id="items"></div>
     <h2>確認</h2>
-    <div class="approvals">${state.meta.roles.map((r) => {
-      const a = d.approvals[r];
-      return `<div class="approval"><div><div class="role">${esc(r)}</div><div class="hint">${esc(state.meta.role_hint[r])}</div></div>
-        <span class="spacer"></span>
-        ${a ? `<span>${esc(a.staff_name)}<br><span class="muted">${esc(a.at.slice(0, 16).replace("T", " "))}${a.detail ? " " + esc(a.detail) : ""}</span></span>
-               <button class="btn small danger" data-unapprove="${esc(r)}">取消</button>`
-            : `<button class="btn primary" data-approve="${esc(r)}">確認する</button>`}
-      </div>`;
-    }).join("")}</div>`;
+    ${approvalsHtml(d.approvals)}`;
   $("#save-drafts")?.addEventListener("click", async (e) => {
     const names = drafted.map((x) => `・${x.it.name}`);
     if (!confirm(`一時保存の ${drafted.length}件を保存しますか？\n\n${names.slice(0, 15).join("\n")}${names.length > 15 ? `\n…ほか${names.length - 15}件` : ""}`)) return;
@@ -405,17 +397,36 @@ async function renderCategory(id) {
   });
   $("#q").addEventListener("input", (e) => { catView.q = e.target.value; draw(); });
   view.querySelectorAll(".chip").forEach((c) => c.addEventListener("click", () => { catView.filter = c.dataset.f; draw(); }));
+  bindApprovals(`/api/months/${state.ym}/categories/${id}/approvals`,
+    left ? `未入力が ${left} 件あります。確認済みにしますか？` : "", () => renderCategory(id));
+  draw();
+}
+
+// ---------- 確認欄（分類画面と期限警告一覧で共通） ----------
+function approvalsHtml(approvals) {
+  return `<div class="approvals">${state.meta.roles.map((r) => {
+    const a = approvals[r];
+    return `<div class="approval"><div><div class="role">${esc(r)}</div><div class="hint">${esc(state.meta.role_hint[r])}</div></div>
+      <span class="spacer"></span>
+      ${a ? `<span>${esc(a.staff_name)}<br><span class="muted">${esc(a.at.slice(0, 16).replace("T", " "))}${a.detail ? " " + esc(a.detail) : ""}</span></span>
+             <button class="btn small danger" data-unapprove="${esc(r)}">取消</button>`
+          : `<button class="btn primary" data-approve="${esc(r)}">確認する</button>`}
+    </div>`;
+  }).join("")}</div>`;
+}
+
+// base = 確認のAPI（…/approvals）。warn があれば確認する前に聞く
+function bindApprovals(base, warn, redraw) {
   view.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", async () => {
-    if (left && !confirm(`未入力が ${left} 件あります。確認済みにしますか？`)) return;
-    try { await api("POST", `/api/months/${state.ym}/categories/${id}/approvals`, { role: b.dataset.approve }); toast("確認しました"); renderCategory(id); }
+    if (warn && !confirm(warn)) return;
+    try { await api("POST", base, { role: b.dataset.approve }); toast("確認しました"); redraw(); }
     catch (e) { toast(e.message, true); }
   }));
   view.querySelectorAll("[data-unapprove]").forEach((b) => b.addEventListener("click", async () => {
     if (!confirm(`${b.dataset.unapprove} の確認を取り消しますか？`)) return;
-    try { await api("DELETE", `/api/months/${state.ym}/categories/${id}/approvals/${encodeURIComponent(b.dataset.unapprove)}`); renderCategory(id); }
+    try { await api("DELETE", `${base}/${encodeURIComponent(b.dataset.unapprove)}`); redraw(); }
     catch (e) { toast(e.message, true); }
   }));
-  draw();
 }
 
 // ---------- 入力シート ----------
@@ -835,7 +846,12 @@ async function renderAlerts() {
       ${todo.length ? `<h2>未対応（${todo.length}件）</h2><p class="muted">対応の予定がまだ入っていません</p><div class="list">${todo.map(row).join("")}</div>` : ""}
       ${undone.length ? `<h2>未実施（${undone.length}件）</h2><p class="muted">予定は入っています。実施したらチェックしてください</p><div class="list">${undone.map(row).join("")}</div>` : ""}
       ${done.length ? `<h2>実施済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`
-    : `<div class="list"><p class="muted" style="padding:14px">警告はありません</p></div>`}`;
+    : `<div class="list"><p class="muted" style="padding:14px">警告はありません</p></div>`}
+    <h2>確認</h2>
+    ${approvalsHtml(d.approvals)}`;
+  bindApprovals(`/api/months/${state.ym}/alerts/approvals`,
+    todo.length + undone.length ? `未対応が ${todo.length} 件、未実施が ${undone.length} 件あります。確認済みにしますか？` : "",
+    () => renderAlerts());
   view.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
     const it = d.items.find((x) => x.id === Number(b.dataset.id));
     openSheet(`<h3>${esc(it.name)}</h3>
@@ -919,7 +935,7 @@ async function renderDiffs() {
 
 // ---------- 管理画面 ----------
 const EXPIRY_MODE = { date: "期限を入力", mfg: "製造日から計算", none: "期限指定無し" };
-const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認", doc: "資料" };
+const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認", alert_approval: "期限警告の確認", doc: "資料" };
 const adminView = { q: "", cat: "", inactive: false, hq: "", hentity: "" };
 
 async function renderAdmin(tab) {

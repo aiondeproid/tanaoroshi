@@ -431,6 +431,27 @@ def test_approval_flow(client):
     assert client.delete(f"{url}/%E6%8B%85%E5%BD%93%E8%80%85", headers=USER).status_code == 200
 
 
+def test_alert_approval_flow(client):
+    """期限警告一覧の確認は、分類に関係なく月ごとに1つ。確認したときの件数を残し、Excel にも出す。"""
+    url = "/api/months/2026-09/alerts/approvals"
+    assert client.post(url, headers=USER, json={"role": "品管"}).status_code == 200
+    assert client.post(url, headers=USER, json={"role": "品管"}).status_code == 409
+    assert client.post(url, headers=USER, json={"role": "社長"}).status_code == 400
+    a = client.get("/api/months/2026-09/alerts").json()["approvals"]
+    assert list(a) == ["品管"] and a["品管"]["staff_name"] == "田中"
+    assert a["品管"]["detail"].startswith("警告")
+    # 別の月や分類の確認には混ざらない
+    assert client.get("/api/months/2026-10/alerts").json()["approvals"] == {}
+    assert client.get("/api/months/2026-09/summary").json()["categories"].get(str(client.cat_id), {}).get("approvals", {}) == {}
+    ws = openpyxl.load_workbook(io.BytesIO(client.get("/api/months/2026-09/export.xlsx").content))["期限警告一覧"]
+    roles = [ws.cell(row=1, column=c).value for c in range(11, 15)]
+    assert roles == ["担当者", "前工程L", "生産管理", "品管"]
+    assert ws.cell(row=2, column=14).value.startswith("田中")
+    assert client.delete(f"{url}/%E5%93%81%E7%AE%A1", headers=USER).status_code == 200
+    assert client.delete(f"{url}/%E5%93%81%E7%AE%A1", headers=USER).status_code == 404
+    assert client.get("/api/months/2026-09/alerts").json()["approvals"] == {}
+
+
 def test_static_is_not_cached(client):
     assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
 
