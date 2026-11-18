@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote, unquote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
@@ -273,7 +273,7 @@ def build_entry(item: dict, ym: str, body: EntryIn, warn_months: int) -> dict:
 
 
 @app.put("/api/months/{ym}/items/{item_id}")
-def save_entry(ym: str, item_id: int, body: EntryIn, bg: BackgroundTasks, user: str = Depends(actor)):
+def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor)):
     ym = check_ym(ym)
     with db.connect() as con:
         item = get_item(con, item_id)
@@ -296,15 +296,6 @@ def save_entry(ym: str, item_id: int, body: EntryIn, bg: BackgroundTasks, user: 
                   f"{ym} {item['code']} {item['name']} {after['total_kg']}kg 期限{after['expiry_date'] or '-'}"
                   f" 棚卸日{after['counted_on']}",
                   before, after)
-        # この入力で分類の全品目がそろったら、最初の確認の役割（担当者）に知らせる
-        if not before:
-            rows = month_items(con, ym, item["category_id"])
-            if all(r["entry_id"] for r in rows):
-                cat = category_name(con, item["category_id"])
-                bg.add_task(mail.notify, ROLES[0], f"{ym_label(ym)} {cat}：{ROLES[0]}の確認をお願いします",
-                            f"{ym_label(ym)}の棚卸で「{cat}」の全{len(rows)}品目の入力が終わりました（最後の入力：{user}）。\n"
-                            f"{ROLES[0]}の確認（{ROLE_HINT[ROLES[0]]}）をお願いします。"
-                            + mail.link(f"?ym={ym}#/cat/{item['category_id']}"), user)
     return after
 
 
@@ -477,6 +468,144 @@ def alerts(ym: str):
     return {"items": rows, "approvals": appr}
 
 
+# 期限警告一覧をメールで送るときの区分（画面の見出しと同じ順）
+ALERT_SECTIONS = {"todo": "未対応", "undone": "未実施", "done": "実施済み"}
+
+
+def alert_section(r) -> str:
+    return "todo" if not r["action"] else "undone" if not r["action_done_by"] else "done"
+
+
+def alert_mail_line(r, today: date) -> str:
+    left = (date.fromisoformat(r["expiry_date"]) - today).days
+    days = f"{-left}日超過" if left < 0 else f"あと{left}日"
+    line = (f"・{r['category_name']} {r['code']} {r['name']}　{r['total_kg']:g}kg"
+            f"　{r['expiry_kind']} {r['expiry_date'].replace('-', '/')}（{days}）")
+    if r["action"]:
+        line += f"\n　　対応：{r['action']}"
+        if r["action_date"]:
+            line += f"　予定 {r['action_date'].replace('-', '/')}"
+        if r["action_done_by"]:
+            line += f"　実施 {(r['action_done_on'] or '').replace('-', '/')} {r['action_done_by']}"
+        if r["action_note"]:
+            line += f"　メモ：{r['action_note']}"
+    return line
+
+
+class MailIn(BaseModel):
+    to: list[str]
+    note: str = Field("", max_length=1000)
+
+
+class AlertMailIn(MailIn):
+    sections: list[Literal["todo", "undone", "done"]] = ["todo", "undone"]
+
+
+@app.get("/api/mail/recipients")
+def mail_recipients():
+    """メールで送るときに選べる送り先（管理画面の「メール」タブで役割ごとに登録したもの）。"""
+    with db.connect() as con:
+        return {"enabled": mail.enabled(), "recipients": {r: mail.recipients(con, r) for r in ROLES}}
+
+
+def check_mail_to(con, to: list[str]) -> list[str]:
+    """画面で選んだ送り先を確かめる。登録したアドレス以外には送らない（社外などへの誤送信を防ぐ）。"""
+    if not mail.enabled():
+        raise HTTPException(400, "メールの送信が設定されていません。管理者に相談してください")
+    to = list(dict.fromkeys(e.strip() for e in to if e.strip()))
+    if not to:
+        raise HTTPException(400, "送り先を選んでください")
+    known = {e for r in ROLES for e in mail.recipients(con, r)}
+    unknown = [e for e in to if e not in known]
+    if unknown:
+        raise HTTPException(400, f"登録されていない送り先です：{', '.join(unknown)}")
+    return to
+
+
+def send_now(to: list[str], subject: str, text: str, user: str, what: str) -> dict:
+    """いますぐ送り、結果を変更履歴に残す。送れなければ理由を画面に返す。"""
+    summary = f"{what} {', '.join(to)} {subject}"
+    try:
+        mail.send_with_timeout(to, subject, text)
+    except Exception as e:  # noqa: BLE001
+        with db.connect() as con:
+            db.record(con, user, "mail", None, "送信失敗", f"{summary}：{type(e).__name__} {e}")
+        raise HTTPException(502, f"送れませんでした：{type(e).__name__} {e}")
+    with db.connect() as con:
+        db.record(con, user, "mail", None, "送信", summary)
+    return {"ok": True, "to": to, "subject": subject}
+
+
+def approval_status(appr: dict) -> tuple[str, str | None]:
+    """確認欄の状況の1行と、次に確認する役割（全部済みなら None）。"""
+    line = " ／ ".join(
+        f"{r} {appr[r]['staff_name']} {appr[r]['at'][5:10].replace('-', '/')}" if r in appr else f"{r} 未"
+        for r in ROLES)
+    nxt = next((r for r in ROLES if r not in appr), None)
+    return line, nxt
+
+
+def mail_text(note: str, parts: list[str], user: str, path: str) -> str:
+    head = [note.strip() + "\n"] if note.strip() else []
+    return "\n".join(head + parts + [f"\n送信：{user}"]) + mail.link(path)
+
+
+@app.post("/api/months/{ym}/alerts/mail")
+def mail_alerts(ym: str, body: AlertMailIn, user: str = Depends(actor)):
+    """期限警告一覧を、選んだ送り先にいますぐメールで送る。"""
+    ym = check_ym(ym)
+    sections = [k for k in ALERT_SECTIONS if k in body.sections]
+    with db.connect() as con:
+        to = check_mail_to(con, body.to)
+        rows = [r for r in month_items(con, ym) if r["status"] in ("warn", "expired")]
+        appr = {r["role"]: dict(r) for r in con.execute("SELECT * FROM alert_approvals WHERE ym=?", (ym,))}
+    if not sections:
+        raise HTTPException(400, "送る内容を選んでください")
+    rows.sort(key=lambda r: r["expiry_date"] or "")
+    today = date.today()
+    counts = {k: sum(1 for r in rows if alert_section(r) == k) for k in ALERT_SECTIONS}
+    status, nxt = approval_status(appr)
+    parts = [f"{ym_label(ym)}の期限警告：" + " ／ ".join(f"{v} {counts[k]}件" for k, v in ALERT_SECTIONS.items()),
+             f"確認：{status}"]
+    for k in sections:
+        sec = [r for r in rows if alert_section(r) == k]
+        parts.append(f"\n【{ALERT_SECTIONS[k]}（{len(sec)}件）】")
+        parts += [alert_mail_line(r, today) for r in sec] or ["（なし）"]
+    subject = (f"[棚卸] {ym_label(ym)} 期限警告一覧（" + "・".join(f"{ALERT_SECTIONS[k]}{counts[k]}件" for k in sections)
+               + (f"・{nxt}の確認待ち" if nxt else "・確認済み") + "）")
+    return send_now(to, subject, mail_text(body.note, parts, user, f"?ym={ym}#/alerts"), user, "期限警告一覧")
+
+
+@app.post("/api/months/{ym}/categories/{category_id}/mail")
+def mail_category(ym: str, category_id: int, body: MailIn, user: str = Depends(actor)):
+    """分類の棚卸の状況（入力の進み具合・×・差異・確認欄）を、選んだ送り先にいますぐメールで送る。"""
+    ym = check_ym(ym)
+    with db.connect() as con:
+        to = check_mail_to(con, body.to)
+        cat = category_name(con, category_id)
+        rows = month_items(con, ym, category_id)
+        appr = {r["role"]: dict(r) for r in con.execute(
+            "SELECT * FROM approvals WHERE ym=? AND category_id=?", (ym, category_id))}
+    left = [r for r in rows if not r["entry_id"]]
+    crosses = [r for r in rows if r["entry_id"] and r["status"] in ("warn", "expired")]
+    expired = sum(1 for r in crosses if r["status"] == "expired")
+    diff = sum(1 for r in rows if r["diff_alert"] and not r["recount_count"])
+    status, nxt = approval_status(appr)
+    parts = [f"{ym_label(ym)} {cat}の棚卸",
+             f"入力：{len(rows) - len(left)} / {len(rows)}品目" + (f"（未入力 {len(left)}）" if left else "（すべて入力済み）"),
+             f"期限警告：×{len(crosses)}件" + (f"（うち期限切れ {expired}件）" if expired else ""),
+             f"予想在庫との差異大：{diff}件",
+             f"確認：{status}"]
+    if left:
+        parts.append(f"\n【未入力（{len(left)}件）】")
+        parts += [f"・{r['code']} {r['name']}" for r in left[:50]]
+        if len(left) > 50:
+            parts.append(f"…ほか{len(left) - 50}件")
+    state_label = f"入力中 {len(rows) - len(left)}/{len(rows)}" if left else f"{nxt}の確認待ち" if nxt else "確認済み"
+    subject = f"[棚卸] {ym_label(ym)} {cat}（{state_label}）"
+    return send_now(to, subject, mail_text(body.note, parts, user, f"?ym={ym}#/cat/{category_id}"), user, cat)
+
+
 @app.get("/api/months/{ym}/diffs")
 def diffs(ym: str):
     """予想在庫との差異が大きい品目と、再棚卸待ちの品目。差の大きい順。"""
@@ -494,7 +623,7 @@ class ApprovalIn(BaseModel):
 
 
 @app.post("/api/months/{ym}/categories/{category_id}/approvals")
-def approve(ym: str, category_id: int, body: ApprovalIn, bg: BackgroundTasks, user: str = Depends(actor)):
+def approve(ym: str, category_id: int, body: ApprovalIn, user: str = Depends(actor)):
     ym = check_ym(ym)
     if body.role not in ROLES:
         raise HTTPException(400, "確認区分が不正です")
@@ -509,7 +638,6 @@ def approve(ym: str, category_id: int, body: ApprovalIn, bg: BackgroundTasks, us
         except sqlite3.IntegrityError:
             raise HTTPException(409, "すでに確認済みです")
         db.record(con, user, "approval", category_id, "確認", f"{ym} {cat} {body.role} {detail}".strip())
-    notify_next(bg, body.role, f"{ym_label(ym)} {cat}", user, f"?ym={ym}#/cat/{category_id}")
     return {"ok": True}
 
 
@@ -527,17 +655,6 @@ def unapprove(ym: str, category_id: int, role: str, user: str = Depends(actor)):
     return {"ok": True}
 
 
-def notify_next(bg: BackgroundTasks, role: str, what: str, user: str, path: str) -> None:
-    """role の確認が済んだら、次の役割の送り先に知らせる。最後の役割（品管）のあとは送らない。"""
-    i = ROLES.index(role)
-    if i + 1 >= len(ROLES):
-        return
-    nxt = ROLES[i + 1]
-    bg.add_task(mail.notify, nxt, f"{what}：{nxt}の確認をお願いします",
-                f"{what}の{role}の確認が済みました（{user}）。\n"
-                f"{nxt}の確認（{ROLE_HINT[nxt]}）をお願いします。" + mail.link(path), user)
-
-
 def alert_counts(rows) -> str:
     """期限警告一覧の確認に残す件数（警告・未対応・未実施）。"""
     al = [r for r in rows if r["status"] in ("warn", "expired")]
@@ -547,7 +664,7 @@ def alert_counts(rows) -> str:
 
 
 @app.post("/api/months/{ym}/alerts/approvals")
-def approve_alerts(ym: str, body: ApprovalIn, bg: BackgroundTasks, user: str = Depends(actor)):
+def approve_alerts(ym: str, body: ApprovalIn, user: str = Depends(actor)):
     ym = check_ym(ym)
     if body.role not in ROLES:
         raise HTTPException(400, "確認区分が不正です")
@@ -559,7 +676,6 @@ def approve_alerts(ym: str, body: ApprovalIn, bg: BackgroundTasks, user: str = D
         except sqlite3.IntegrityError:
             raise HTTPException(409, "すでに確認済みです")
         db.record(con, user, "alert_approval", None, "確認", f"{ym} 期限警告一覧 {body.role} {detail}")
-    notify_next(bg, body.role, f"{ym_label(ym)} 期限警告一覧", user, f"?ym={ym}#/alerts")
     return {"ok": True}
 
 
@@ -1064,7 +1180,7 @@ def test_mail(body: MailTestIn, user: str = Depends(admin)):
     if not mail.enabled():
         raise HTTPException(400, "メールの送信が設定されていません（TANAOROSHI_MAIL_VIA）")
     try:
-        mail.send([to], "[棚卸] テストメール", f"棚卸アプリからのテストメールです（送信：{user}）。" + mail.link())
+        mail.send_with_timeout([to], "[棚卸] テストメール", f"棚卸アプリからのテストメールです（送信：{user}）。" + mail.link())
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"送れませんでした：{type(e).__name__} {e}")
     return {"ok": True}

@@ -1,4 +1,4 @@
-"""確認フローの各ステップで、次の担当にメールを送る。
+"""分類の画面と期限警告一覧の「メールで送る」ボタンから、選んだ送り先にメールを送る（自動では送らない）。
 
 送り先は確認の役割（担当者・前工程L・生産管理・品管）ごとに管理画面で登録する（notify_to テーブル）。
 送り方は環境変数 TANAOROSHI_MAIL_VIA で選ぶ。
@@ -93,7 +93,7 @@ def send_notes(to: list[str], subject: str, body: str) -> None:
 
 def send_outlook(to: list[str], subject: str, body: str) -> None:
     """このPCの Outlook（既定のアカウント）から送る。送ったメールは Outlook の「送信済みアイテム」に残る。
-    BackgroundTasks はスレッドで動くので、スレッドごとに COM を初期化する。同時に操作しないよう1通ずつ送る。"""
+    send_with_timeout が別のスレッドで呼ぶので、スレッドごとに COM を初期化する。同時に操作しないよう1通ずつ送る。"""
     import pythoncom
     import win32com.client
 
@@ -148,21 +148,21 @@ def link(path: str = "") -> str:
     return f"\n\n開く: {url}/{path}" if url else ""
 
 
-def notify(role: str, subject: str, body: str, actor: str) -> None:
-    """役割 role の送り先にメールを送り、結果を変更履歴に残す。
-    BackgroundTasks から呼ぶので、画面の応答は待たせない。送れなくても画面の操作は成功のまま。"""
-    if not enabled():
-        return
-    with db.connect() as con:
-        to = recipients(con, role)
-    if not to:
-        return
-    subject = f"[棚卸] {subject}"
-    try:
-        send(to, subject, body)
-    except Exception as e:  # noqa: BLE001 — SMTP、ネットワーク、名前解決など何でも履歴に残す
-        with db.connect() as con:
-            db.record(con, actor, "mail", None, "送信失敗", f"{role}宛 {subject}：{type(e).__name__} {e}")
-        return
-    with db.connect() as con:
-        db.record(con, actor, "mail", None, "送信", f"{role}宛（{len(to)}人） {subject}")
+def send_with_timeout(to: list[str], subject: str, body: str, timeout: float = 90) -> None:
+    """画面のボタンから送るとき用。Notes がパスワードの画面などで止まっていても、画面を待たせ続けない。
+    時間内に終わらなければ TimeoutError にする（止まった送信は裏に残り、Notes が戻れば送られることがある）。"""
+    err: list[BaseException] = []
+
+    def run():
+        try:
+            send(to, subject, body)
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError("メールソフトが応答しません。Notes が起動してログインしているか、画面が止まっていないか確かめてください")
+    if err:
+        raise err[0]

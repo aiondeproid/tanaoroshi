@@ -203,3 +203,8 @@ input[type=date][readonly] { cursor: pointer; min-width: 11em; font-size: 19px; 
 .viewer-bar .doc-name { font-size: 15px; font-weight: 700; }
 .viewer-pages { flex: 1; overflow: auto; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12px; }
 .viewer-pages img { width: 100%; max-width: 1200px; background: #fff; }
+
+/* 期限警告一覧をメールで送るときの送り先・内容の選択 */
+.mail-role { border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; margin-top: 6px; background: var(--card); }
+.check { display: flex; align-items: center; gap: 10px; min-height: 40px; overflow-wrap: anywhere; }
+.check input { width: 22px; height: 22px; flex: none; }

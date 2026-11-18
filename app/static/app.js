@@ -384,7 +384,10 @@ async function renderCategory(id) {
     </div>
     <div class="list" id="items"></div>
     <h2>確認</h2>
-    ${approvalsHtml(d.approvals)}`;
+    ${approvalsHtml(d.approvals)}
+    <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn" id="mail-cat">メールで送る</button></div>`;
+  $("#mail-cat").addEventListener("click", () => openMailSheet({
+    title: d.category.name, path: `/api/months/${state.ym}/categories/${id}/mail`, approvals: d.approvals }));
   $("#save-drafts")?.addEventListener("click", async (e) => {
     const names = drafted.map((x) => `・${x.it.name}`);
     if (!confirm(`一時保存の ${drafted.length}件を保存しますか？\n\n${names.slice(0, 15).join("\n")}${names.length > 15 ? `\n…ほか${names.length - 15}件` : ""}`)) return;
@@ -850,6 +853,7 @@ async function renderAlerts() {
       ${todo.length + undone.length
         ? `<div class="banner warn">未対応 ${todo.length}件 ／ 未実施 ${undone.length}件 ／ 実施済み ${done.length}件</div>`
         : `<div class="banner ok">すべて実施済みです（${done.length}件）</div>`}
+      <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn" id="mail-alerts">メールで送る</button></div>
       ${todo.length ? `<h2>未対応（${todo.length}件）</h2><p class="muted">対応の予定がまだ入っていません</p><div class="list">${todo.map(row).join("")}</div>` : ""}
       ${undone.length ? `<h2>未実施（${undone.length}件）</h2><p class="muted">予定は入っています。実施したらチェックしてください</p><div class="list">${undone.map(row).join("")}</div>` : ""}
       ${done.length ? `<h2>実施済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`
@@ -859,6 +863,10 @@ async function renderAlerts() {
   bindApprovals(`/api/months/${state.ym}/alerts/approvals`,
     todo.length + undone.length ? `未対応が ${todo.length} 件、未実施が ${undone.length} 件あります。確認済みにしますか？` : "",
     () => renderAlerts());
+  $("#mail-alerts")?.addEventListener("click", () => openMailSheet({
+    title: "期限警告一覧", path: `/api/months/${state.ym}/alerts/mail`, approvals: d.approvals,
+    sections: { todo: `未対応（${todo.length}件）`, undone: `未実施（${undone.length}件）`, done: `実施済み（${done.length}件）` },
+    checked: ["todo", "undone"] }));
   view.querySelectorAll("[data-id]").forEach((b) => b.addEventListener("click", () => {
     const it = d.items.find((x) => x.id === Number(b.dataset.id));
     openSheet(`<h3>${esc(it.name)}</h3>
@@ -900,6 +908,62 @@ async function renderAlerts() {
       catch (e) { toast(e.message, true); }
     });
   }));
+}
+
+// メールで送る画面（分類の画面と期限警告一覧で共通）。送り先は管理画面で役割ごとに登録したアドレスから選ぶ
+// opts = { title, path（送るAPI）, approvals（確認欄）, sections（{key: ラベル}、送る内容を選ぶとき）, checked（最初に選ぶ内容） }
+async function openMailSheet(opts) {
+  let r;
+  try { r = await api("GET", "/api/mail/recipients"); } catch (e) { return toast(e.message, true); }
+  if (!r.enabled) return toast("メールの送信が設定されていません。管理者に相談してください", true);
+  // 送り先が未登録の役割も出す（選べないが、登録が足りないことに気づけるように）
+  const roles = state.meta.roles;
+  if (!roles.some((role) => r.recipients[role].length)) return toast("送り先が登録されていません。管理画面の「メール」タブで登録してください", true);
+  // 次に確認する役割（確認欄でまだ済んでいない最初の役割）を最初から選んでおく
+  const next = state.meta.roles.find((role) => !opts.approvals[role]);
+  const secs = opts.sections || {};
+  openSheet(`<h3>${esc(opts.title)}をメールで送る</h3>
+    <div class="muted" style="margin-top:4px">送り先${next ? `（次は${esc(next)}の確認です）` : "（確認はすべて済んでいます）"}</div>
+    ${roles.map((role, i) => {
+      const list = r.recipients[role];
+      const on = role === next && list.length ? "checked" : "";
+      return `<div class="mail-role">
+      <label class="check"><input type="checkbox" data-role-all="${i}" ${on} ${list.length ? "" : "disabled"}> <b>${esc(role)}</b>${role === next ? ` <span class="pill todo">次</span>` : ""}</label>
+      ${list.length
+        ? list.map((e) => `<label class="check"><input type="checkbox" data-to="${esc(e)}" data-role-of="${i}" ${on}> ${esc(e)}</label>`).join("")
+        : `<div class="muted" style="padding:4px 0 8px">送り先が未登録です（管理画面の「メール」タブで登録）</div>`}
+    </div>`;
+    }).join("")}
+    ${Object.keys(secs).length ? `<div class="muted" style="margin-top:12px">送る内容</div>
+      <div class="mail-role">${Object.entries(secs).map(([k, v]) =>
+        `<label class="check"><input type="checkbox" data-sec="${k}" ${(opts.checked || []).includes(k) ? "checked" : ""}> ${esc(v)}</label>`).join("")}</div>` : ""}
+    <div class="muted" style="margin-top:12px">ひとこと（なくてもよい）</div>
+    <textarea id="mail-note" maxlength="1000" placeholder="例：${next ? `${esc(next)}の確認をお願いします` : "ご確認ください"}"></textarea>
+    <div class="actions-bar"><button class="btn" id="close">閉じる</button><button class="btn primary" id="send">送る</button></div>`);
+  const boxes = [...sheet.querySelectorAll("[data-to]")];
+  // 役割にチェックすると、その役割のアドレスをまとめて選ぶ
+  sheet.querySelectorAll("[data-role-all]").forEach((all) => all.addEventListener("change", () => {
+    boxes.filter((b) => b.dataset.roleOf === all.dataset.roleAll).forEach((b) => { b.checked = all.checked; });
+  }));
+  boxes.forEach((b) => b.addEventListener("change", () => {
+    const mine = boxes.filter((x) => x.dataset.roleOf === b.dataset.roleOf);
+    sheet.querySelector(`[data-role-all="${b.dataset.roleOf}"]`).checked = mine.every((x) => x.checked);
+  }));
+  $("#close").addEventListener("click", closeSheet);
+  $("#send").addEventListener("click", async () => {
+    // 同じアドレスが複数の役割にあっても1回だけ送る
+    const to = [...new Set(boxes.filter((b) => b.checked).map((b) => b.dataset.to))];
+    const body = { to, note: $("#mail-note").value };
+    if (!to.length) return toast("送り先を選んでください", true);
+    if (Object.keys(secs).length) {
+      body.sections = [...sheet.querySelectorAll("[data-sec]")].filter((b) => b.checked).map((b) => b.dataset.sec);
+      if (!body.sections.length) return toast("送る内容を選んでください", true);
+    }
+    if (!confirm(`${to.length}人に送りますか？\n${to.join("\n")}`)) return;
+    $("#send").disabled = true;
+    try { await api("POST", opts.path, body); closeSheet(); toast("送りました"); }
+    catch (e) { toast(e.message, true); $("#send").disabled = false; }
+  });
 }
 
 // ---------- 差異一覧（予想在庫との差が大きい品目） ----------
@@ -1262,11 +1326,8 @@ async function adminMail() {
   const el = $("#admin");
   const roles = state.meta.roles;
   el.innerHTML = `
-    <p>確認の各ステップで、次の役割の送り先にメールを送ります。</p>
-    <ul class="muted">
-      <li>分類の全品目の入力が終わったとき → ${esc(roles[0])}</li>
-      <li>分類の確認・期限警告一覧の確認が済んだとき → 次の役割（${roles.map(esc).join(" → ")}）</li>
-    </ul>
+    <p>分類の画面と期限警告一覧の「メールで送る」ボタンで、ここに登録した送り先から選んでメールを送ります（自動では送りません）。</p>
+    <p class="muted">送る画面では、次に確認する役割（${roles.map(esc).join(" → ")} のうち、まだ確認していない最初の役割）が最初から選ばれます。</p>
     ${d.enabled
       ? `<div class="banner ok">${d.via === "notes"
           ? "このPCの Notes から送ります（差出人は Notes にログインしている人。送ったメールは Notes の「送信済み」に残ります。Notes は起動したままにしてください）"

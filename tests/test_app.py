@@ -719,52 +719,57 @@ def test_mail_recipients_admin(client):
 def test_mail_not_sent_without_smtp(client, monkeypatch):
     from app import mail
     monkeypatch.delenv("TANAOROSHI_SMTP_HOST", raising=False)
+    monkeypatch.delenv("TANAOROSHI_MAIL_VIA", raising=False)
     called = []
     monkeypatch.setattr(mail, "send", lambda *a: called.append(a))
     client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": ["a@x.jp"]})
-    url = f"/api/months/2026-08/categories/{client.cat_id}/approvals"
-    assert client.post(url, headers=USER, json={"role": "担当者"}).status_code == 200
-    assert called == []
+    r = client.post(f"/api/months/2026-08/categories/{client.cat_id}/mail", headers=USER, json={"to": ["a@x.jp"]})
+    assert r.status_code == 400 and called == []
     assert client.post("/api/admin/mail/test", headers=ADMIN, json={"to": "a@x.jp"}).status_code == 400
-    client.delete(f"{url}/%E6%8B%85%E5%BD%93%E8%80%85", headers=USER)
     client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": []})
 
 
-def test_mail_on_each_step(client, sent):
-    """入力がそろうと担当者へ、各確認が済むと次の役割へ送る。品管のあとは送らない。"""
+def test_mail_not_sent_automatically(client, sent):
+    """入力がそろっても、確認を押しても、メールは自動では送らない（ボタンで送る）。"""
     for i, r in enumerate(["担当者", "前工程L", "生産管理", "品管"]):
         client.put(f"/api/admin/mail/{r}", headers=ADMIN, json={"emails": [f"r{i}@x.jp"]})
     cat = client.post("/api/admin/categories", json={"grp": "メール", "name": "メール分類"}, headers=ADMIN).json()
     ids = [client.post("/api/admin/items", headers=ADMIN, json={"code": f"M{n}", "name": f"品{n}", "category_id": cat["id"],
                                                                 "case_weight": 1, "expiry_mode": "none"}).json()["id"] for n in (1, 2)]
     ym = "2026-07"
-    body = {"room_cases": 1, "expiry_kind": "賞"}
-    assert client.put(f"/api/months/{ym}/items/{ids[0]}", headers=USER, json=body).status_code == 200
-    assert sent == []  # まだ1品目残っている
-    assert client.put(f"/api/months/{ym}/items/{ids[1]}", headers=USER, json=body).status_code == 200
-    assert len(sent) == 1
-    to, subject, text = sent[0]
-    assert to == ["r0@x.jp"] and subject == "[棚卸] 2026年7月 メール分類：担当者の確認をお願いします"
-    assert f"http://server:8000/?ym={ym}#/cat/{cat['id']}" in text
-    # 入れ直しでは送らない
-    client.put(f"/api/months/{ym}/items/{ids[1]}", headers=USER, json=body)
-    assert len(sent) == 1
-
-    url = f"/api/months/{ym}/categories/{cat['id']}/approvals"
-    for role in ["担当者", "前工程L", "生産管理", "品管"]:
-        assert client.post(url, headers=USER, json={"role": role}).status_code == 200
-    assert [s[0] for s in sent[1:]] == [["r1@x.jp"], ["r2@x.jp"], ["r3@x.jp"]]
-    assert "前工程Lの確認をお願いします" in sent[1][1] and "担当者の確認が済みました（田中）" in sent[1][2]
-
-    # 期限警告一覧の確認も同じ
-    del sent[:]
-    assert client.post(f"/api/months/{ym}/alerts/approvals", headers=USER, json={"role": "前工程L"}).status_code == 200
-    assert sent[0][0] == ["r2@x.jp"] and "期限警告一覧：生産管理の確認をお願いします" in sent[0][1]
-    assert "#/alerts" in sent[0][2]
-    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
-    assert h[0]["action"] == "送信" and "生産管理宛" in h[0]["summary"]
-    for i, r in enumerate(["担当者", "前工程L", "生産管理", "品管"]):
+    for i in ids:
+        assert client.put(f"/api/months/{ym}/items/{i}", headers=USER, json={"room_cases": 1, "expiry_kind": "賞"}).status_code == 200
+    assert client.post(f"/api/months/{ym}/categories/{cat['id']}/approvals", headers=USER, json={"role": "担当者"}).status_code == 200
+    assert client.post(f"/api/months/{ym}/alerts/approvals", headers=USER, json={"role": "担当者"}).status_code == 200
+    assert sent == []
+    for r in ["担当者", "前工程L", "生産管理", "品管"]:
         client.put(f"/api/admin/mail/{r}", headers=ADMIN, json={"emails": []})
+
+
+def test_mail_category_button(client, sent):
+    """分類の状況（入力の進み具合・未入力の品目・確認欄）を、選んだ送り先に送る。"""
+    client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": ["l@x.jp"]})
+    cat = client.post("/api/admin/categories", json={"grp": "分類メール", "name": "分類メール"}, headers=ADMIN).json()
+    ids = [client.post("/api/admin/items", headers=ADMIN, json={"code": f"C{n}", "name": f"分類品{n}", "category_id": cat["id"],
+                                                                "case_weight": 1, "expiry_mode": "none"}).json()["id"] for n in (1, 2)]
+    ym = "2026-04"
+    url = f"/api/months/{ym}/categories/{cat['id']}/mail"
+    client.put(f"/api/months/{ym}/items/{ids[0]}", headers=USER, json={"room_cases": 1, "expiry_kind": "賞"})
+    assert client.post(url, headers=USER, json={"to": ["evil@x.jp"]}).status_code == 400
+    assert client.post(url, headers=USER, json={"to": ["l@x.jp"], "note": "途中です"}).status_code == 200
+    to, subject, text = sent[-1]
+    assert to == ["l@x.jp"] and subject == "[棚卸] 2026年4月 分類メール（入力中 1/2）"
+    assert text.startswith("途中です") and "入力：1 / 2品目（未入力 1）" in text and "・C2 分類品2" in text
+    assert "確認：担当者 未 ／ 前工程L 未" in text and f"?ym={ym}#/cat/{cat['id']}" in text
+    client.put(f"/api/months/{ym}/items/{ids[1]}", headers=USER, json={"room_cases": 1, "expiry_kind": "賞"})
+    client.post(f"/api/months/{ym}/categories/{cat['id']}/approvals", headers=USER, json={"role": "担当者"})
+    assert client.post(url, headers=USER, json={"to": ["l@x.jp"]}).status_code == 200
+    to, subject, text = sent[-1]
+    assert subject == "[棚卸] 2026年4月 分類メール（前工程Lの確認待ち）"
+    assert "すべて入力済み" in text and "担当者 田中" in text and "未入力（" not in text
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert h[0]["action"] == "送信" and "分類メール" in h[0]["summary"]
+    client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": []})
 
 
 def test_mail_failure_is_recorded(client, sent, monkeypatch):
@@ -774,8 +779,8 @@ def test_mail_failure_is_recorded(client, sent, monkeypatch):
         raise OSError("connection refused")
     monkeypatch.setattr(mail, "send", boom)
     client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": ["q@x.jp"]})
-    r = client.post("/api/months/2026-06/alerts/approvals", headers=USER, json={"role": "生産管理"})
-    assert r.status_code == 200  # 送れなくても確認は成功
+    r = client.post(f"/api/months/2026-06/categories/{client.cat_id}/mail", headers=USER, json={"to": ["q@x.jp"]})
+    assert r.status_code == 502 and "connection refused" in r.json()["detail"]
     h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
     assert h[0]["action"] == "送信失敗" and "connection refused" in h[0]["summary"]
     assert client.post("/api/admin/mail/test", headers=ADMIN, json={"to": "q@x.jp"}).status_code == 502
@@ -889,10 +894,60 @@ def test_mail_url_setting(client, sent):
     d = client.get("/api/admin/mail", headers=ADMIN).json()
     assert d["app_url"] == "http://192.168.1.10:8000" and d["app_url_env"] == "http://server:8000"
     client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": ["q@x.jp"]})
-    client.post("/api/months/2026-05/alerts/approvals", headers=USER, json={"role": "生産管理"})
+    client.post("/api/months/2026-05/alerts/mail", headers=USER, json={"to": ["q@x.jp"]})
     assert "開く: http://192.168.1.10:8000/?ym=2026-05#/alerts" in sent[-1][2]
     h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
     assert any(r["action"] == "リンク変更" for r in h)
     assert client.put(url, headers=ADMIN, json={"url": ""}).status_code == 200
     assert client.get("/api/admin/mail", headers=ADMIN).json()["app_url"] == "http://server:8000"
     client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": []})
+
+
+def test_mail_alerts_button(client, sent):
+    """期限警告一覧を、選んだ送り先に送る。登録していない送り先には送らない。"""
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": ["q@x.jp", "q2@x.jp"]})
+    r = client.get("/api/mail/recipients").json()
+    assert r["enabled"] and r["recipients"]["品管"] == ["q@x.jp", "q2@x.jp"]
+    cat = client.post("/api/admin/categories", json={"grp": "警告メール", "name": "警告メール"}, headers=ADMIN).json()
+    ids = [client.post("/api/admin/items", headers=ADMIN, json={"code": f"W{n}", "name": f"警告品{n}", "category_id": cat["id"],
+                                                                "case_weight": 2}).json()["id"] for n in (1, 2)]
+    ym = date.today().strftime("%Y-%m")
+    from datetime import timedelta
+    soon = (date.today() + timedelta(days=5)).isoformat()
+    for i in ids:
+        client.put(f"/api/months/{ym}/items/{i}", headers=USER, json={"room_cases": 1, "expiry_kind": "賞", "expiry_date": soon})
+    client.put(f"/api/months/{ym}/items/{ids[1]}/action", headers=USER,
+               json={"action": "廃棄", "action_date": soon, "action_note": "至急"})
+    del sent[:]
+    url = f"/api/months/{ym}/alerts/mail"
+    assert client.post(url, headers=USER, json={"to": []}).status_code == 400
+    assert client.post(url, headers=USER, json={"to": ["evil@x.jp"]}).status_code == 400
+    assert client.post(url, headers=USER, json={"to": ["q@x.jp"], "sections": []}).status_code == 400
+    res = client.post(url, headers=USER, json={"to": ["q@x.jp", "q@x.jp"], "sections": ["undone"], "note": "確認お願いします"})
+    assert res.status_code == 200
+    to, subject, text = sent[0]
+    assert to == ["q@x.jp"] and subject.startswith("[棚卸] ") and "期限警告一覧（未実施" in subject
+    assert text.startswith("確認お願いします") and "警告品2" in text and "対応：廃棄" in text and "メモ：至急" in text
+    assert "警告品1" not in text  # 未対応は選んでいない
+    assert f"?ym={ym}#/alerts" in text
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert h[0]["action"] == "送信" and "q@x.jp" in h[0]["summary"]
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": []})
+
+
+def test_send_with_timeout(monkeypatch):
+    """メールソフトが止まっていても、画面を待たせ続けない。"""
+    import threading
+
+    from app import mail
+    stop = threading.Event()
+    monkeypatch.setattr(mail, "send", lambda *a: stop.wait(5))
+    with pytest.raises(TimeoutError):
+        mail.send_with_timeout(["a@x.jp"], "s", "b", timeout=0.2)
+    stop.set()
+
+    def boom(*a):
+        raise OSError("x")
+    monkeypatch.setattr(mail, "send", boom)
+    with pytest.raises(OSError):
+        mail.send_with_timeout(["a@x.jp"], "s", "b")
