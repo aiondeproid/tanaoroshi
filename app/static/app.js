@@ -853,7 +853,7 @@ async function renderAlerts() {
       ${todo.length + undone.length
         ? `<div class="banner warn">未対応 ${todo.length}件 ／ 未実施 ${undone.length}件 ／ 実施済み ${done.length}件</div>`
         : `<div class="banner ok">すべて実施済みです（${done.length}件）</div>`}
-      <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn" id="mail-alerts">メールで送る</button></div>
+      <div class="row" style="justify-content:flex-end;margin-top:8px"><a class="btn" href="/api/months/${state.ym}/export.xlsx?order=alerts" style="text-decoration:none;display:inline-flex;align-items:center">Excelで出力</a><button class="btn" id="mail-alerts">メールで送る</button></div>
       ${todo.length ? `<h2>未対応（${todo.length}件）</h2><p class="muted">対応の予定がまだ入っていません</p><div class="list">${todo.map(row).join("")}</div>` : ""}
       ${undone.length ? `<h2>未実施（${undone.length}件）</h2><p class="muted">予定は入っています。実施したらチェックしてください</p><div class="list">${undone.map(row).join("")}</div>` : ""}
       ${done.length ? `<h2>実施済み（${done.length}件）</h2><div class="list">${done.map(row).join("")}</div>` : ""}`

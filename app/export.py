@@ -13,6 +13,10 @@ BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 HEAD_FILL = PatternFill("solid", fgColor="D9E1F2")
 WARN_FILL = PatternFill("solid", fgColor="FFF2CC")
 EXPIRED_FILL = PatternFill("solid", fgColor="F8CBAD")
+# 期限警告一覧で分類を見分ける行の色（判定の黄・橙と紛れない淡い色。分類の並び順に割り当て、足りなければ繰り返す）
+CAT_FILLS = [PatternFill("solid", fgColor=c) for c in
+             ("DDEBF7", "E2EFDA", "E4DFEC", "FCE4EC", "D9F2F2", "EDEDED", "E8F0D0", "F2E6DA")]
+OTHER_CAT_FILL = PatternFill("solid", fgColor="FFFFFF")
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 WRAP = Alignment(vertical="center", wrap_text=True)
 STATUS_TEXT = {"ok": "レ", "warn": "×（{}ヶ月以内）", "expired": "×（期限切れ）", "none": ""}
@@ -151,7 +155,7 @@ def item_sheet(ws, ym: str, title: str, items, split: bool, with_cat: bool = Fal
 
 
 def build(con, ym: str, month_items, roles: list[str], order: str = "category") -> bytes:
-    """order="category"：分類ごとのシート、"code"：全品目をコード順に1シートにまとめる。"""
+    """order="category"：分類ごとのシート、"code"：全品目をコード順に1シートにまとめる、"alerts"：期限警告一覧だけ。"""
     y, m = map(int, ym.split("-"))
     rows = month_items(con, ym)
     cats = [dict(r) for r in con.execute("SELECT * FROM categories WHERE active=1 ORDER BY sort")]
@@ -185,14 +189,18 @@ def build(con, ym: str, month_items, roles: list[str], order: str = "category") 
              "実施日", "実施確認", "担当者", "棚卸日"]
     for i, h in enumerate(heads, 1):
         cell(ws, top, i, h, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
+    JUDGE_COL = heads.index("判定") + 1
+    cat_fill = {c["id"]: CAT_FILLS[i % len(CAT_FILLS)] for i, c in enumerate(cats)}
     r = first = top + 1
     for it in sorted((x for x in rows if x["status"] in ("warn", "expired")), key=lambda x: x["expiry_date"] or ""):
         vals = [it["category_name"], it["code"], it["name"], it["total_kg"], it["expiry_kind"],
                 jdate(it["expiry_date"]), status_text(it), it["action"], jdate(it["action_date"]),
                 it["action_note"], jdate(it["action_done_on"]), it["action_done_by"] or ("未実施" if it["action"] else ""),
                 it["counted_by"], jdate(it["counted_on"])]
-        fill = EXPIRED_FILL if it["status"] == "expired" else WARN_FILL
+        # 行は分類ごとの色、判定の欄だけ警告（黄）・期限切れ（橙）の色
+        row_fill = cat_fill.get(it["category_id"], OTHER_CAT_FILL)
         for i, v in enumerate(vals, 1):
+            fill = (EXPIRED_FILL if it["status"] == "expired" else WARN_FILL) if i == JUDGE_COL else row_fill
             cell(ws, r, i, v, border=BORDER, alignment=WRAP, fill=fill)
         r += 1
     if r == first:
@@ -213,7 +221,9 @@ def build(con, ym: str, month_items, roles: list[str], order: str = "category") 
     ws.page_margins.top = ws.page_margins.bottom = 0.6
     ws.oddFooter.center.text = "&P / &N ページ"
 
-    if order == "code":
+    if order == "alerts":
+        pass  # 期限警告一覧の画面から：1枚目だけ
+    elif order == "code":
         # 全分類をコード順に1枚にまとめる（分類の列を足し、保管場所は分けて書ける形にそろえる）
         items = sorted(rows, key=lambda x: (x["code"], x["category_name"]))
         if items:

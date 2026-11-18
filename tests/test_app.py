@@ -4,6 +4,7 @@ import os
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 os.environ["TANAOROSHI_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
 os.environ["TANAOROSHI_ADMIN_PIN"] = "9999"
@@ -470,6 +471,13 @@ def test_export_xlsx(client):
     col = heads.index("棚卸日") + 1
     row = codes.index("04084") + 7
     assert ws.cell(row=row, column=col).value == f"{today.year}/{today.month}/{today.day}"
+    # 期限警告一覧は A4横・横1ページで印刷でき、見出し行が各ページに出る
+    ws = wb["期限警告一覧"]
+    top = next(r for r in range(1, 10) if ws.cell(row=r, column=1).value == "分類")
+    assert int(ws.page_setup.paperSize) == int(ws.PAPERSIZE_A4) and ws.page_setup.orientation == "landscape"
+    assert ws.sheet_properties.pageSetUpPr.fitToPage and ws.page_setup.fitToWidth == 1
+    assert ws.print_title_rows == f"${top}:${top}"
+    assert ws.print_area.startswith("'期限警告一覧'!$A$1:$N$")
 
 
 def test_month_items_for_search(client):
@@ -497,6 +505,33 @@ def test_export_xlsx_code_order(client):
     # 既定は分類ごと
     wb = openpyxl.load_workbook(io.BytesIO(client.get("/api/months/2026-09/export.xlsx?order=xxx").content))
     assert "全品目（コード順）" not in wb.sheetnames
+
+
+def test_export_xlsx_alerts_only(client):
+    """期限警告一覧の画面からは、期限警告一覧のシートだけの Excel を出す。"""
+    r = client.get("/api/months/2026-09/export.xlsx?order=alerts")
+    assert r.status_code == 200
+    assert quote("期限警告一覧_2026-09.xlsx") in r.headers["content-disposition"]
+    wb = openpyxl.load_workbook(io.BytesIO(r.content))
+    assert wb.sheetnames == ["期限警告一覧"]
+
+
+def test_export_alerts_colored_by_category(client):
+    """期限警告一覧の行は分類ごとの色。判定の欄だけは期限切れ・警告の色。"""
+    from app import export
+    ym = "2027-03"
+    it = items(client, ym)["01009"]  # 04084 は前のテストで終売にしたので、製造日から期限を出す品で期限切れにする
+    r = client.put(f"/api/months/{ym}/items/{it['id']}", headers=USER, json={"room_cases": 1, "mfg_date": "2020-01-01"})
+    assert r.json()["status"] == "expired"
+    ws = openpyxl.load_workbook(io.BytesIO(client.get(f"/api/months/{ym}/export.xlsx?order=alerts").content)).active
+    top = next(r for r in range(1, 10) if ws.cell(row=r, column=1).value == "分類")
+    heads = [c.value for c in ws[top]]
+    row = top + 1
+    assert ws.cell(row=row, column=heads.index("コード") + 1).value == "01009"
+    colors = {f.fgColor.rgb[-6:] for f in export.CAT_FILLS}
+    assert ws.cell(row=row, column=1).fill.fgColor.rgb[-6:] in colors
+    assert ws.cell(row=row, column=3).fill.fgColor.rgb == ws.cell(row=row, column=1).fill.fgColor.rgb
+    assert ws.cell(row=row, column=heads.index("判定") + 1).fill.fgColor.rgb[-6:] == "F8CBAD"
 
 
 def test_items_excel_round_trip(client):

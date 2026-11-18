@@ -695,12 +695,12 @@ def unapprove_alerts(ym: str, role: str, user: str = Depends(actor)):
 
 @app.get("/api/months/{ym}/export.xlsx")
 def export_xlsx(ym: str, order: str = "category"):
-    """order=code なら全品目をコード順に1シートにまとめる（既定は分類ごとのシート）。"""
+    """order=code なら全品目をコード順に1シートにまとめる、order=alerts なら期限警告一覧だけ（既定は分類ごとのシート）。"""
     ym = check_ym(ym)
-    order = "code" if order == "code" else "category"
+    order = order if order in ("code", "alerts") else "category"
     with db.connect() as con:
         data = export.build(con, ym, month_items, ROLES, order)
-    name = f"原料棚卸_{ym}{'_コード順' if order == 'code' else ''}.xlsx"
+    name = {"code": f"原料棚卸_{ym}_コード順.xlsx", "alerts": f"期限警告一覧_{ym}.xlsx"}.get(order, f"原料棚卸_{ym}.xlsx")
     return Response(
         data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
