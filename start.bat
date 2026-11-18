@@ -14,6 +14,16 @@ if not exist ".venv\Scripts\python.exe" (
 rem Admin PIN. Change this before real use.
 if "%TANAOROSHI_ADMIN_PIN%"=="" set TANAOROSHI_ADMIN_PIN=1234
 
+rem Mail to the next approver. notes = send from HCL Notes on this PC (keep Notes running and logged in).
+rem outlook = send from Outlook on this PC. none = send no mail.
+if "%TANAOROSHI_MAIL_VIA%"=="" set TANAOROSHI_MAIL_VIA=notes
+rem To use a mail server instead, set TANAOROSHI_MAIL_VIA=smtp and e.g.
+rem   set TANAOROSHI_SMTP_HOST=smtp.example.local
+rem   set TANAOROSHI_SMTP_PORT=25
+rem   set TANAOROSHI_MAIL_FROM=tanaoroshi@example.local
+rem Link written in the mail:
+if "%TANAOROSHI_URL%"=="" set TANAOROSHI_URL=http://%COMPUTERNAME%:8000
+
 echo.
 echo Open  http://%COMPUTERNAME%:8000  on a tablet or phone.
 echo Press Ctrl+C to stop.

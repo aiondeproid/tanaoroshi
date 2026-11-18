@@ -1,17 +1,18 @@
 import json
 import os
+import re
 import sqlite3
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote, unquote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import db, expected_xlsx, export, items_xlsx, logic, pdf_pages
+from . import db, expected_xlsx, export, items_xlsx, logic, mail, pdf_pages
 
 ADMIN_PIN = os.environ.get("TANAOROSHI_ADMIN_PIN", "1234")
 STATIC = Path(__file__).resolve().parent / "static"
@@ -57,6 +58,11 @@ def check_ym(ym: str) -> str:
 
 def parse_date(s: str | None) -> date | None:
     return date.fromisoformat(s) if s else None
+
+
+def ym_label(ym: str) -> str:
+    y, m = map(int, ym.split("-"))
+    return f"{y}年{m}月"
 
 
 def get_item(con, item_id: int) -> dict:
@@ -267,7 +273,7 @@ def build_entry(item: dict, ym: str, body: EntryIn, warn_months: int) -> dict:
 
 
 @app.put("/api/months/{ym}/items/{item_id}")
-def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor)):
+def save_entry(ym: str, item_id: int, body: EntryIn, bg: BackgroundTasks, user: str = Depends(actor)):
     ym = check_ym(ym)
     with db.connect() as con:
         item = get_item(con, item_id)
@@ -290,6 +296,15 @@ def save_entry(ym: str, item_id: int, body: EntryIn, user: str = Depends(actor))
                   f"{ym} {item['code']} {item['name']} {after['total_kg']}kg 期限{after['expiry_date'] or '-'}"
                   f" 棚卸日{after['counted_on']}",
                   before, after)
+        # この入力で分類の全品目がそろったら、最初の確認の役割（担当者）に知らせる
+        if not before:
+            rows = month_items(con, ym, item["category_id"])
+            if all(r["entry_id"] for r in rows):
+                cat = category_name(con, item["category_id"])
+                bg.add_task(mail.notify, ROLES[0], f"{ym_label(ym)} {cat}：{ROLES[0]}の確認をお願いします",
+                            f"{ym_label(ym)}の棚卸で「{cat}」の全{len(rows)}品目の入力が終わりました（最後の入力：{user}）。\n"
+                            f"{ROLES[0]}の確認（{ROLE_HINT[ROLES[0]]}）をお願いします。"
+                            + mail.link(f"?ym={ym}#/cat/{item['category_id']}"), user)
     return after
 
 
@@ -479,7 +494,7 @@ class ApprovalIn(BaseModel):
 
 
 @app.post("/api/months/{ym}/categories/{category_id}/approvals")
-def approve(ym: str, category_id: int, body: ApprovalIn, user: str = Depends(actor)):
+def approve(ym: str, category_id: int, body: ApprovalIn, bg: BackgroundTasks, user: str = Depends(actor)):
     ym = check_ym(ym)
     if body.role not in ROLES:
         raise HTTPException(400, "確認区分が不正です")
@@ -494,6 +509,7 @@ def approve(ym: str, category_id: int, body: ApprovalIn, user: str = Depends(act
         except sqlite3.IntegrityError:
             raise HTTPException(409, "すでに確認済みです")
         db.record(con, user, "approval", category_id, "確認", f"{ym} {cat} {body.role} {detail}".strip())
+    notify_next(bg, body.role, f"{ym_label(ym)} {cat}", user, f"?ym={ym}#/cat/{category_id}")
     return {"ok": True}
 
 
@@ -511,6 +527,17 @@ def unapprove(ym: str, category_id: int, role: str, user: str = Depends(actor)):
     return {"ok": True}
 
 
+def notify_next(bg: BackgroundTasks, role: str, what: str, user: str, path: str) -> None:
+    """role の確認が済んだら、次の役割の送り先に知らせる。最後の役割（品管）のあとは送らない。"""
+    i = ROLES.index(role)
+    if i + 1 >= len(ROLES):
+        return
+    nxt = ROLES[i + 1]
+    bg.add_task(mail.notify, nxt, f"{what}：{nxt}の確認をお願いします",
+                f"{what}の{role}の確認が済みました（{user}）。\n"
+                f"{nxt}の確認（{ROLE_HINT[nxt]}）をお願いします。" + mail.link(path), user)
+
+
 def alert_counts(rows) -> str:
     """期限警告一覧の確認に残す件数（警告・未対応・未実施）。"""
     al = [r for r in rows if r["status"] in ("warn", "expired")]
@@ -520,7 +547,7 @@ def alert_counts(rows) -> str:
 
 
 @app.post("/api/months/{ym}/alerts/approvals")
-def approve_alerts(ym: str, body: ApprovalIn, user: str = Depends(actor)):
+def approve_alerts(ym: str, body: ApprovalIn, bg: BackgroundTasks, user: str = Depends(actor)):
     ym = check_ym(ym)
     if body.role not in ROLES:
         raise HTTPException(400, "確認区分が不正です")
@@ -532,6 +559,7 @@ def approve_alerts(ym: str, body: ApprovalIn, user: str = Depends(actor)):
         except sqlite3.IntegrityError:
             raise HTTPException(409, "すでに確認済みです")
         db.record(con, user, "alert_approval", None, "確認", f"{ym} 期限警告一覧 {body.role} {detail}")
+    notify_next(bg, body.role, f"{ym_label(ym)} 期限警告一覧", user, f"?ym={ym}#/alerts")
     return {"ok": True}
 
 
@@ -958,6 +986,87 @@ def update_staff(staff_id: int, body: StaffIn, user: str = Depends(admin)):
         change = diff_summary(before, after, {"name": "名前", "sort": "並び順", "active": "有効"})
         if change:
             db.record(con, user, "staff", staff_id, "変更", f"{after['name']}：{change}", before, after)
+    return {"ok": True}
+
+
+# ---------- メールの送り先 ----------
+
+class MailToIn(BaseModel):
+    emails: list[str]
+
+
+class MailTestIn(BaseModel):
+    to: str
+
+
+EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+
+
+@app.get("/api/admin/mail")
+def admin_mail(_: str = Depends(admin)):
+    c = mail.config()
+    with db.connect() as con:
+        to = {r: mail.recipients(con, r) for r in ROLES}
+        saved = con.execute("SELECT value FROM settings WHERE key='mail_url'").fetchone()
+    return {"enabled": mail.enabled(), "via": c["via"], "host": c["host"], "port": c["port"], "sender": c["sender"],
+            "app_url": mail.app_url(), "app_url_saved": saved["value"] if saved else "", "app_url_env": c["app_url"],
+            "recipients": to}
+
+
+class MailUrlIn(BaseModel):
+    url: str
+
+
+URL_RE = re.compile(r"^https?://[^\s/?#:]+(:\d+)?(/[^\s?#]*)?$")
+
+
+@app.put("/api/admin/mail-url")
+def update_mail_url(body: MailUrlIn, user: str = Depends(admin)):
+    """メールに書く画面のアドレス。空にすると環境変数 TANAOROSHI_URL に戻る。"""
+    url = body.url.strip().rstrip("/")
+    if url and not URL_RE.match(url):
+        raise HTTPException(400, "アドレスは http://192.168.1.10:8000 のように入れてください")
+    with db.connect() as con:
+        r = con.execute("SELECT value FROM settings WHERE key='mail_url'").fetchone()
+        before = r["value"] if r else ""
+        if before == url:
+            return {"ok": True}
+        con.execute("INSERT INTO settings (key, value) VALUES ('mail_url', ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (url,))
+        db.record(con, user, "mail", None, "リンク変更", f"メールのリンク：{before or '初期値'} → {url or '初期値'}")
+    return {"ok": True}
+
+
+@app.put("/api/admin/mail/{role}")
+def update_mail_to(role: str, body: MailToIn, user: str = Depends(admin)):
+    if role not in ROLES:
+        raise HTTPException(400, "確認区分が不正です")
+    emails = list(dict.fromkeys(e.strip() for e in body.emails if e.strip()))
+    bad = [e for e in emails if not EMAIL_RE.match(e)]
+    if bad:
+        raise HTTPException(400, f"メールアドレスの形式が不正です：{', '.join(bad)}")
+    with db.connect() as con:
+        before = mail.recipients(con, role)
+        if before == emails:
+            return {"ok": True}
+        con.execute("DELETE FROM notify_to WHERE role=?", (role,))
+        con.executemany("INSERT INTO notify_to (role, email) VALUES (?,?)", [(role, e) for e in emails])
+        db.record(con, user, "mail", None, "送り先変更",
+                  f"{role}：{', '.join(before) or 'なし'} → {', '.join(emails) or 'なし'}", before, emails)
+    return {"ok": True}
+
+
+@app.post("/api/admin/mail/test")
+def test_mail(body: MailTestIn, user: str = Depends(admin)):
+    to = body.to.strip()
+    if not EMAIL_RE.match(to):
+        raise HTTPException(400, "メールアドレスの形式が不正です")
+    if not mail.enabled():
+        raise HTTPException(400, "メールの送信が設定されていません（TANAOROSHI_MAIL_VIA）")
+    try:
+        mail.send([to], "[棚卸] テストメール", f"棚卸アプリからのテストメールです（送信：{user}）。" + mail.link())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"送れませんでした：{type(e).__name__} {e}")
     return {"ok": True}
 
 

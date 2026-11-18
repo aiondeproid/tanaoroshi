@@ -3,3 +3,4 @@ uvicorn[standard]
 openpyxl
 xlrd
 pypdfium2
+pywin32; sys_platform == "win32"

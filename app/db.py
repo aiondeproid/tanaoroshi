@@ -115,6 +115,18 @@ CREATE TABLE IF NOT EXISTS item_docs (
     added_by TEXT NOT NULL,
     added_at TEXT NOT NULL
 );
+-- 管理画面で変える設定（key=mail_url：メールに書く画面のアドレス など）
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- 確認フローのメールの送り先（確認の役割ごと）
+CREATE TABLE IF NOT EXISTS notify_to (
+    id INTEGER PRIMARY KEY,
+    role TEXT NOT NULL,
+    email TEXT NOT NULL,
+    UNIQUE (role, email)
+);
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY,
     at TEXT NOT NULL,

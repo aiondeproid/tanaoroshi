@@ -169,6 +169,13 @@ function currentYm() {
 async function init() {
   state.meta = await api("GET", "/api/meta");
   try { state.ym = sessionStorage.getItem("tanaoroshi.ym") || currentYm(); } catch { state.ym = currentYm(); }
+  // メールのリンク（?ym=2026-10#/cat/3）から開いたときは、その月にする
+  const linkYm = new URLSearchParams(location.search).get("ym");
+  if (/^\d{4}-\d{2}$/.test(linkYm || "")) {
+    state.ym = linkYm;
+    try { sessionStorage.setItem("tanaoroshi.ym", state.ym); } catch {}
+    history.replaceState(null, "", location.pathname + location.hash);
+  }
   try { state.pin = sessionStorage.getItem("tanaoroshi.pin"); } catch {}
   const ymInput = $("#ym");
   ymInput.value = state.ym;
@@ -935,7 +942,7 @@ async function renderDiffs() {
 
 // ---------- 管理画面 ----------
 const EXPIRY_MODE = { date: "期限を入力", mfg: "製造日から計算", none: "期限指定無し" };
-const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認", alert_approval: "期限警告の確認", doc: "資料" };
+const ENTITY = { item: "品目", category: "分類", staff: "担当者", entry: "棚卸入力", expected: "予想在庫", approval: "確認", alert_approval: "期限警告の確認", doc: "資料", mail: "メール" };
 const adminView = { q: "", cat: "", inactive: false, hq: "", hentity: "" };
 
 async function renderAdmin(tab) {
@@ -978,12 +985,12 @@ async function renderAdmin(tab) {
     $("#pin").addEventListener("keydown", (e) => e.key === "Enter" && go());
     return;
   }
-  const tabs = { items: "品目", categories: "分類", staff: "担当者", expected: "予想在庫", history: "変更履歴" };
+  const tabs = { items: "品目", categories: "分類", staff: "担当者", expected: "予想在庫", mail: "メール", history: "変更履歴" };
   view.innerHTML = `<a class="back" href="#/">← 戻る</a><h1>管理画面</h1>
     <nav class="tabs">${Object.entries(tabs).map(([k, v]) => `<a href="#/admin/${k}" class="${k === tab ? "on" : ""}">${v}</a>`).join("")}</nav>
     <div id="admin"></div>`;
   try {
-    await { items: adminItems, categories: adminCategories, staff: adminStaff, expected: adminExpected, history: adminHistory }[tab]();
+    await { items: adminItems, categories: adminCategories, staff: adminStaff, expected: adminExpected, mail: adminMail, history: adminHistory }[tab]();
   } catch (e) {
     if (/PIN/.test(e.message)) { state.pin = null; try { sessionStorage.removeItem("tanaoroshi.pin"); } catch {} return renderAdmin(tab); }
     throw e;
@@ -1247,6 +1254,55 @@ async function adminExpected() {
       if (r.ok) toast("取り込みました");
     } catch (e) { toast(e.message, true); }
     finally { $("#x_go").disabled = false; }
+  });
+}
+
+async function adminMail() {
+  const d = await api("GET", "/api/admin/mail");
+  const el = $("#admin");
+  const roles = state.meta.roles;
+  el.innerHTML = `
+    <p>確認の各ステップで、次の役割の送り先にメールを送ります。</p>
+    <ul class="muted">
+      <li>分類の全品目の入力が終わったとき → ${esc(roles[0])}</li>
+      <li>分類の確認・期限警告一覧の確認が済んだとき → 次の役割（${roles.map(esc).join(" → ")}）</li>
+    </ul>
+    ${d.enabled
+      ? `<div class="banner ok">${d.via === "notes"
+          ? "このPCの Notes から送ります（差出人は Notes にログインしている人。送ったメールは Notes の「送信済み」に残ります。Notes は起動したままにしてください）"
+          : d.via === "outlook"
+          ? "このPCの Outlook から送ります（差出人は Outlook にサインインしている人。送ったメールは Outlook の送信済みアイテムに残ります）"
+          : `送信サーバー：${esc(d.host)}:${d.port}　差出人：${esc(d.sender)}`}</div>`
+      : `<div class="notice">メールの送信が設定されていないため、送り先を登録してもメールは送りません。環境変数 TANAOROSHI_MAIL_VIA を notes にして、アプリを起動し直してください。</div>`}
+    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>役割</th><th>送り先（1行に1人）</th><th></th></tr></thead>
+    <tbody>${roles.map((r, i) => `<tr><td style="white-space:nowrap">${esc(r)}</td>
+      <td><textarea class="text" rows="3" style="width:100%" data-role="${i}" placeholder="name@example.co.jp">${esc(d.recipients[r].join("\n"))}</textarea></td>
+      <td><button class="btn small primary" data-save="${i}">保存</button></td></tr>`).join("")}</tbody></table></div>
+    <h3 style="margin-top:18px">メールに書く画面のアドレス</h3>
+    <p class="muted">タブレットやスマホのブラウザで開けるアドレスを入れます（例：http://192.168.1.10:8000）。空にして保存すると初期値（${esc(d.app_url_env || "なし")}）に戻ります。</p>
+    <div class="row"><input class="text" id="m_url" type="url" value="${esc(d.app_url_saved)}" placeholder="${esc(d.app_url_env || "http://192.168.1.10:8000")}" style="flex:1">
+      <button class="btn primary" id="m_url_save">保存</button></div>
+    <p class="muted">いまのリンクの例：${d.app_url ? esc(d.app_url + "/?ym=" + state.ym + "#/alerts") : "（アドレスがないため、メールにリンクは入りません）"}</p>
+    <div class="row" style="margin-top:14px"><input class="text" id="m_test" type="email" placeholder="テストの送り先" style="flex:1">
+      <button class="btn" id="m_send" ${d.enabled ? "" : "disabled"}>テストメールを送る</button></div>
+    <p class="muted">送った結果と送れなかったときの理由は「変更履歴」の「メール」に残ります。</p>`;
+  el.querySelectorAll("[data-save]").forEach((b) => b.addEventListener("click", async () => {
+    const role = roles[Number(b.dataset.save)];
+    const emails = el.querySelector(`[data-role="${b.dataset.save}"]`).value.split(/[\s,;]+/).filter(Boolean);
+    try { await api("PUT", `/api/admin/mail/${encodeURIComponent(role)}`, { emails }); toast(`${role}の送り先を保存しました`); adminMail(); }
+    catch (e) { toast(e.message, true); }
+  }));
+  $("#m_url_save").addEventListener("click", async () => {
+    try { await api("PUT", "/api/admin/mail-url", { url: $("#m_url").value }); toast("アドレスを保存しました"); adminMail(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $("#m_send").addEventListener("click", async () => {
+    const to = $("#m_test").value.trim();
+    if (!to) return toast("送り先を入れてください", true);
+    $("#m_send").disabled = true;
+    try { await api("POST", "/api/admin/mail/test", { to }); toast("送りました。届いたか確かめてください"); }
+    catch (e) { toast(e.message, true); }
+    finally { $("#m_send").disabled = false; }
   });
 }
 

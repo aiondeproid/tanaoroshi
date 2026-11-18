@@ -687,3 +687,212 @@ def test_category_warn_months_rejudges_this_month(client):
     assert "再判定" in [h["action"] for h in client.get("/api/admin/history?entity=entry", headers=ADMIN).json()]
     # 新しく保存するときも分類の月数で判定する
     assert client.put(url, headers=USER, json={"room_cases": 2, "expiry_date": expiry}).json()["status"] == "warn"
+
+
+# ---------- メール ----------
+
+@pytest.fixture
+def sent(monkeypatch):
+    """SMTP を設定した状態にして、送ったメールを記録する（実際には送らない）。"""
+    from app import mail
+    monkeypatch.setenv("TANAOROSHI_SMTP_HOST", "smtp.example.local")
+    monkeypatch.setenv("TANAOROSHI_MAIL_FROM", "tanaoroshi@example.local")
+    monkeypatch.setenv("TANAOROSHI_URL", "http://server:8000")
+    out = []
+    monkeypatch.setattr(mail, "send", lambda to, subject, body: out.append((to, subject, body)))
+    return out
+
+
+def test_mail_recipients_admin(client):
+    url = "/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL"  # 前工程L
+    assert client.put(url, headers=USER, json={"emails": []}).status_code == 403
+    assert client.put(url, headers=ADMIN, json={"emails": ["bad"]}).status_code == 400
+    assert client.put("/api/admin/mail/%E7%A4%BE%E9%95%B7", headers=ADMIN, json={"emails": []}).status_code == 400
+    assert client.put(url, headers=ADMIN, json={"emails": [" a@x.jp ", "b@x.jp", "a@x.jp", ""]}).status_code == 200
+    d = client.get("/api/admin/mail", headers=ADMIN).json()
+    assert d["recipients"]["前工程L"] == ["a@x.jp", "b@x.jp"] and d["recipients"]["品管"] == []
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert h[0]["action"] == "送り先変更" and "a@x.jp" in h[0]["summary"]
+    assert client.put(url, headers=ADMIN, json={"emails": []}).status_code == 200
+
+
+def test_mail_not_sent_without_smtp(client, monkeypatch):
+    from app import mail
+    monkeypatch.delenv("TANAOROSHI_SMTP_HOST", raising=False)
+    called = []
+    monkeypatch.setattr(mail, "send", lambda *a: called.append(a))
+    client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": ["a@x.jp"]})
+    url = f"/api/months/2026-08/categories/{client.cat_id}/approvals"
+    assert client.post(url, headers=USER, json={"role": "担当者"}).status_code == 200
+    assert called == []
+    assert client.post("/api/admin/mail/test", headers=ADMIN, json={"to": "a@x.jp"}).status_code == 400
+    client.delete(f"{url}/%E6%8B%85%E5%BD%93%E8%80%85", headers=USER)
+    client.put("/api/admin/mail/%E5%89%8D%E5%B7%A5%E7%A8%8BL", headers=ADMIN, json={"emails": []})
+
+
+def test_mail_on_each_step(client, sent):
+    """入力がそろうと担当者へ、各確認が済むと次の役割へ送る。品管のあとは送らない。"""
+    for i, r in enumerate(["担当者", "前工程L", "生産管理", "品管"]):
+        client.put(f"/api/admin/mail/{r}", headers=ADMIN, json={"emails": [f"r{i}@x.jp"]})
+    cat = client.post("/api/admin/categories", json={"grp": "メール", "name": "メール分類"}, headers=ADMIN).json()
+    ids = [client.post("/api/admin/items", headers=ADMIN, json={"code": f"M{n}", "name": f"品{n}", "category_id": cat["id"],
+                                                                "case_weight": 1, "expiry_mode": "none"}).json()["id"] for n in (1, 2)]
+    ym = "2026-07"
+    body = {"room_cases": 1, "expiry_kind": "賞"}
+    assert client.put(f"/api/months/{ym}/items/{ids[0]}", headers=USER, json=body).status_code == 200
+    assert sent == []  # まだ1品目残っている
+    assert client.put(f"/api/months/{ym}/items/{ids[1]}", headers=USER, json=body).status_code == 200
+    assert len(sent) == 1
+    to, subject, text = sent[0]
+    assert to == ["r0@x.jp"] and subject == "[棚卸] 2026年7月 メール分類：担当者の確認をお願いします"
+    assert f"http://server:8000/?ym={ym}#/cat/{cat['id']}" in text
+    # 入れ直しでは送らない
+    client.put(f"/api/months/{ym}/items/{ids[1]}", headers=USER, json=body)
+    assert len(sent) == 1
+
+    url = f"/api/months/{ym}/categories/{cat['id']}/approvals"
+    for role in ["担当者", "前工程L", "生産管理", "品管"]:
+        assert client.post(url, headers=USER, json={"role": role}).status_code == 200
+    assert [s[0] for s in sent[1:]] == [["r1@x.jp"], ["r2@x.jp"], ["r3@x.jp"]]
+    assert "前工程Lの確認をお願いします" in sent[1][1] and "担当者の確認が済みました（田中）" in sent[1][2]
+
+    # 期限警告一覧の確認も同じ
+    del sent[:]
+    assert client.post(f"/api/months/{ym}/alerts/approvals", headers=USER, json={"role": "前工程L"}).status_code == 200
+    assert sent[0][0] == ["r2@x.jp"] and "期限警告一覧：生産管理の確認をお願いします" in sent[0][1]
+    assert "#/alerts" in sent[0][2]
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert h[0]["action"] == "送信" and "生産管理宛" in h[0]["summary"]
+    for i, r in enumerate(["担当者", "前工程L", "生産管理", "品管"]):
+        client.put(f"/api/admin/mail/{r}", headers=ADMIN, json={"emails": []})
+
+
+def test_mail_failure_is_recorded(client, sent, monkeypatch):
+    from app import mail
+
+    def boom(*a):
+        raise OSError("connection refused")
+    monkeypatch.setattr(mail, "send", boom)
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": ["q@x.jp"]})
+    r = client.post("/api/months/2026-06/alerts/approvals", headers=USER, json={"role": "生産管理"})
+    assert r.status_code == 200  # 送れなくても確認は成功
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert h[0]["action"] == "送信失敗" and "connection refused" in h[0]["summary"]
+    assert client.post("/api/admin/mail/test", headers=ADMIN, json={"to": "q@x.jp"}).status_code == 502
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": []})
+
+
+def test_mail_via_outlook(client, monkeypatch):
+    """TANAOROSHI_MAIL_VIA=outlook なら、メールサーバーの設定なしで Outlook から送る。"""
+    import sys
+    import types
+
+    from app import mail
+    monkeypatch.delenv("TANAOROSHI_SMTP_HOST", raising=False)
+    monkeypatch.setenv("TANAOROSHI_MAIL_VIA", "outlook")
+    items_made = []
+
+    class Item:
+        def Send(self):
+            items_made.append((self.To, self.Subject, self.Body))
+
+    app_obj = types.SimpleNamespace(CreateItem=lambda kind: Item())
+    client_mod = types.ModuleType("win32com.client")
+    client_mod.Dispatch = lambda name: app_obj
+    win32com = types.ModuleType("win32com")
+    win32com.client = client_mod
+    pythoncom = types.ModuleType("pythoncom")
+    pythoncom.CoInitialize = pythoncom.CoUninitialize = lambda: None
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client_mod)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+
+    assert mail.enabled()
+    assert client.get("/api/admin/mail", headers=ADMIN).json()["via"] == "outlook"
+    assert client.post("/api/admin/mail/test", headers=ADMIN, json={"to": "me@x.jp"}).status_code == 200
+    assert items_made[0][0] == "me@x.jp" and items_made[0][1] == "[棚卸] テストメール"
+
+
+def test_mail_via_notes(client, monkeypatch):
+    """TANAOROSHI_MAIL_VIA=notes なら、Notes のメールファイルから送る。本文の改行は行ごとに入れる。"""
+    import sys
+    import types
+
+    from app import mail
+    monkeypatch.setenv("TANAOROSHI_MAIL_VIA", "notes")
+    sent_docs = []
+
+    class Obj:
+        def _FlagAsMethod(self, *names):
+            pass
+
+    class RichText(Obj):
+        def __init__(self):
+            self.text = ""
+
+        def AppendText(self, t):
+            self.text += t
+
+        def AddNewLine(self, n):
+            self.text += "\n" * n
+
+    class Doc(Obj):
+        def __init__(self):
+            self.items = {}
+
+        def ReplaceItemValue(self, k, v):
+            self.items[k] = v
+
+        def CreateRichTextItem(self, k):
+            self.items[k] = RichText()
+            return self.items[k]
+
+        def Send(self, attach):
+            sent_docs.append(self)
+
+    class Db(Obj):
+        IsOpen = False
+
+        def OpenMail(self):
+            self.IsOpen = True
+
+        def CreateDocument(self):
+            return Doc()
+
+    class Session(Obj):
+        def GetDatabase(self, server, path):
+            return Db()
+
+    client_mod = types.ModuleType("win32com.client")
+    client_mod.Dispatch = lambda name: Session() if name == "Notes.NotesSession" else None
+    win32com = types.ModuleType("win32com")
+    win32com.client = client_mod
+    pythoncom = types.ModuleType("pythoncom")
+    pythoncom.CoInitialize = pythoncom.CoUninitialize = lambda: None
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client_mod)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+
+    assert client.get("/api/admin/mail", headers=ADMIN).json()["via"] == "notes"
+    mail.send(["a@x.jp", "b@x.jp"], "件名", "1行目\n2行目")
+    d = sent_docs[0]
+    assert d.items["SendTo"] == ["a@x.jp", "b@x.jp"] and d.items["Subject"] == "件名" and d.items["Form"] == "Memo"
+    assert d.items["Body"].text == "1行目\n2行目" and d.SaveMessageOnSend is True
+
+
+def test_mail_url_setting(client, sent):
+    """メールのリンクのアドレスは管理画面で直せる。空にすると環境変数に戻る。"""
+    url = "/api/admin/mail-url"
+    assert client.put(url, headers=USER, json={"url": "http://x"}).status_code == 403
+    assert client.put(url, headers=ADMIN, json={"url": "192.168.1.10:8000"}).status_code == 400
+    assert client.put(url, headers=ADMIN, json={"url": "http://192.168.1.10:8000/"}).status_code == 200
+    d = client.get("/api/admin/mail", headers=ADMIN).json()
+    assert d["app_url"] == "http://192.168.1.10:8000" and d["app_url_env"] == "http://server:8000"
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": ["q@x.jp"]})
+    client.post("/api/months/2026-05/alerts/approvals", headers=USER, json={"role": "生産管理"})
+    assert "開く: http://192.168.1.10:8000/?ym=2026-05#/alerts" in sent[-1][2]
+    h = client.get("/api/admin/history?entity=mail", headers=ADMIN).json()
+    assert any(r["action"] == "リンク変更" for r in h)
+    assert client.put(url, headers=ADMIN, json={"url": ""}).status_code == 200
+    assert client.get("/api/admin/mail", headers=ADMIN).json()["app_url"] == "http://server:8000"
+    client.put("/api/admin/mail/%E5%93%81%E7%AE%A1", headers=ADMIN, json={"emails": []})
