@@ -175,7 +175,8 @@ def build(con, ym: str, month_items, roles: list[str], order: str = "category") 
     for i, role in enumerate(roles):
         a = alert_appr.get(role)
         cell(ws, 1, 11 + i, role, fill=HEAD_FILL, border=BORDER, alignment=CENTER, font=Font(bold=True))
-        cell(ws, 2, 11 + i, f"{a['staff_name']}\n{a['at'][:10]}\n{a['detail']}" if a else "", border=BORDER, alignment=CENTER)
+        cell(ws, 2, 11 + i, f"{a['staff_name']}\n{a['at'][:10]}" + (f"\n{a['detail']}" if a["detail"] else "") if a else "",
+             border=BORDER, alignment=CENTER)
     ws.row_dimensions[2].height = 45
     for i, (months, names) in enumerate(sorted(by_months.items())):
         cell(ws, 2 + i, 1, rule_text(ym, months) + ("" if len(by_months) == 1 else f"（{'・'.join(names)}）"))
@@ -196,12 +197,21 @@ def build(con, ym: str, month_items, roles: list[str], order: str = "category") 
         r += 1
     if r == first:
         cell(ws, r, 1, "警告はありません")
-    for i, w in enumerate([16, 10, 32, 11, 6, 12, 15, 16, 12, 28, 11, 10, 10, 11], 1):
+    for i, w in enumerate([14, 9, 28, 10, 6, 11, 15, 14, 11, 24, 11, 10, 10, 11], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
+    # 印刷：A4横・横幅を1ページに収め、縦は何ページでも。見出し行は各ページに出し、下にページ番号
+    ws.freeze_panes = ws.cell(row=top + 1, column=1).coordinate
+    ws.print_area = f"A1:{get_column_letter(len(heads))}{max(r, first)}"
+    ws.print_title_rows = f"{top}:{top}"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.horizontalCentered = True
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.page_margins.top = ws.page_margins.bottom = 0.6
+    ws.oddFooter.center.text = "&P / &N ページ"
 
     if order == "code":
         # 全分類をコード順に1枚にまとめる（分類の列を足し、保管場所は分けて書ける形にそろえる）
